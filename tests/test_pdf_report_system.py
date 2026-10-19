@@ -382,3 +382,121 @@ def test_18_existing_api_preservation(client):
     data = health_resp.json()
     assert data["status"] == "healthy"
     assert MANDATORY_DISCLAIMER in data["disclaimer"]
+
+
+def test_19_pdf_metric_values_consistency_tables_and_narrative(tmp_path, synthetic_mri_and_mask):
+    """
+    Regression Test:
+    Ensures that the same authoritative evaluation result metrics are used consistently
+    in all tables and narrative callout paragraphs, with zero contradictory metrics.
+    """
+    import pymupdf as fitz
+
+    mri_file, mask_file, shape, affine = synthetic_mri_and_mask
+    mask_data = nib.load(mask_file).get_fdata().astype(np.uint8)
+    volumes = calculate_region_volumes(mask_data, (1.0, 1.0, 1.0))
+
+    out_pdf = str(tmp_path / "report_consistency_test.pdf")
+    prov = {
+        "model_name": "MONAI brats_mri_segmentation (SegResNet)",
+        "model_license": "Apache 2.0",
+        "training_data_source": "BraTS 2018 Multimodal Brain Tumor Dataset",
+        "git_commit": "a1b2c3d",
+        "timestamp": "2026-10-18T12:00:00Z",
+        "input_sha256": {
+            "t1": compute_file_sha256(mri_file),
+            "t1gd": compute_file_sha256(mri_file),
+            "t2": compute_file_sha256(mri_file),
+            "flair": compute_file_sha256(mri_file),
+        },
+    }
+
+    # Authoritative evaluation object with exact tested values
+    case_eval = {
+        "available": True,
+        "metrics": {
+            "WT": {
+                "dice": 0.9513,
+                "sensitivity": 0.9305,
+                "precision": 0.9730,
+                "specificity": 0.9997,
+                "hd95_mm": 2.00,
+                "tp_voxels": 92403,
+                "fp_voxels": 2560,
+                "fn_voxels": 6899,
+                "predicted_volume_ml": 94.96,
+                "reference_volume_ml": 99.30,
+                "signed_diff_ml": -4.34,
+                "relative_diff_percent": -4.4,
+            },
+            "TC": {
+                "dice": 0.9584,
+                "sensitivity": 0.9522,
+                "precision": 0.9646,
+                "specificity": 0.9998,
+                "hd95_mm": 2.45,
+                "tp_voxels": 50328,
+                "fp_voxels": 1847,
+                "fn_voxels": 2527,
+                "predicted_volume_ml": 52.18,
+                "reference_volume_ml": 52.86,
+                "signed_diff_ml": -0.68,
+                "relative_diff_percent": -1.3,
+            },
+            "ET": {
+                "dice": 0.8722,
+                "sensitivity": 0.8236,
+                "precision": 0.9269,
+                "specificity": 0.9998,
+                "hd95_mm": 1.41,
+                "tp_voxels": 26394,
+                "fp_voxels": 2081,
+                "fn_voxels": 5653,
+                "predicted_volume_ml": 28.48,
+                "reference_volume_ml": 32.05,
+                "signed_diff_ml": -3.57,
+                "relative_diff_percent": -11.1,
+            },
+        },
+    }
+
+    generate_pdf_report(
+        case_id="case_test_consistency",
+        output_pdf_path=out_pdf,
+        volumes=volumes,
+        spatial_metadata={"shape": list(shape), "spacing_mm": [1.0, 1.0, 1.0]},
+        provenance=prov,
+        case_evaluation=case_eval,
+        runtime_seconds=10.5,
+        mri_path=mri_file,
+        mask_path=mask_file,
+    )
+
+    doc = fitz.open(out_pdf)
+    assert len(doc) == 4, f"Expected 4 pages, got {len(doc)}"
+
+    # Check Page 3 text for metric concordance between table and narrative
+    p3_text = doc[2].get_text()
+
+    # WT Dice: 0.9513 in both
+    assert "0.9513" in p3_text
+    assert "0.9328" not in p3_text, "Conflicting WT Dice 0.9328 found in narrative"
+
+    # TC Dice: 0.9584 in both
+    assert "0.9584" in p3_text
+    assert "0.9392" not in p3_text, "Conflicting TC Dice 0.9392 found in narrative"
+
+    # ET HD95: 1.41 mm in both
+    assert "1.41 mm" in p3_text
+    assert "2.24 mm" not in p3_text, "Conflicting ET HD95 2.24 mm found in narrative"
+
+    # ET volume difference: -3.57 mL in both
+    assert "-3.57" in p3_text
+    assert "-0.72 mL" not in p3_text, "Conflicting ET volume difference -0.72 mL found in narrative"
+
+    # Disclaimers on every page
+    for i, page in enumerate(doc):
+        text = page.get_text()
+        assert "Research and Teaching" in text or "Research & Teaching" in text
+        assert "Not for Clinical Diagnosis" in text
+

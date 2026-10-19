@@ -129,6 +129,10 @@ class Provenance(BaseModel):
     git_commit: Optional[str] = None
     timestamp: str
     input_sha256: Dict[str, str]
+    execution_mode: Optional[str] = None
+    checkpoint_file: Optional[str] = None
+    demonstration_notice: Optional[str] = None
+    timing_breakdown: Optional[Dict[str, Any]] = None
 
 
 class CaseOutputs(BaseModel):
@@ -136,6 +140,8 @@ class CaseOutputs(BaseModel):
     report_url: str
     agreement_mask_url: Optional[str] = None
     uncertainty_map_url: Optional[str] = None
+    probability_map_url: Optional[str] = None
+    boundary_mask_url: Optional[str] = None
     summary_url: Optional[str] = None
 
 

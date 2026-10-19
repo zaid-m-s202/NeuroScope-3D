@@ -53,7 +53,7 @@ from backend.app.services.storage import (
 )
 from backend.app.services.pdf_report import generate_pdf_report
 from backend.app.services.boundary_watch import analyze_boundary_watch
-from inference.predict import run_pipeline, PreprocessingError, PostprocessingError
+from inference.predict import run_pipeline, generate_boundary_map, PreprocessingError, PostprocessingError
 from evaluation.evaluate import evaluate_case
 import nibabel as nib
 import numpy as np
@@ -124,14 +124,53 @@ def enforce_secure_case_id(case_id: str) -> str:
         )
 
 
+def resolve_weights_path() -> str:
+    """
+    Resolves the SegResNet model weights path, checking both .pt and .ts extensions
+    and falling back to the repository root if running with a working directory inside backend/.
+    If MODEL_WEIGHTS_PATH is explicitly set, respects that setting.
+    """
+    env_weights = os.getenv("MODEL_WEIGHTS_PATH")
+    if env_weights:
+        candidates = [
+            env_weights,
+            env_weights.replace(".ts", ".pt") if env_weights.endswith(".ts") else env_weights.replace(".pt", ".ts"),
+        ]
+        for c in candidates:
+            if os.path.exists(c):
+                return os.path.abspath(c)
+
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
+        for c in candidates:
+            full_c = os.path.join(repo_root, c) if not os.path.isabs(c) else c
+            if os.path.exists(full_c):
+                return full_c
+
+        return os.path.abspath(env_weights)
+
+    default_candidates = [
+        "models/brats_mri_segmentation/models/model.pt",
+        "models/brats_mri_segmentation/models/model.ts",
+    ]
+    for c in default_candidates:
+        if os.path.exists(c):
+            return os.path.abspath(c)
+
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
+    for c in default_candidates:
+        full_c = os.path.join(repo_root, c)
+        if os.path.exists(full_c):
+            return full_c
+
+    return os.path.abspath(default_candidates[0])
+
+
 @router.api_route("/health", methods=["GET", "HEAD"], response_model=HealthResponse)
 def health_check() -> HealthResponse:
     """Backend operational status and model readiness."""
     cleanup_expired_cases()  # Purge any cases > 24 hours
     model_device = os.getenv("MODEL_DEVICE", "cpu")
-    weights_path = os.getenv("MODEL_WEIGHTS_PATH", "models/brats_mri_segmentation/models/model.ts")
-    if not os.path.exists(weights_path) and os.path.exists(weights_path.replace(".ts", ".pt")):
-        weights_path = weights_path.replace(".ts", ".pt")
+    weights_path = resolve_weights_path()
 
     try:
         import torch
@@ -734,9 +773,7 @@ def trigger_segmentation(case_id: str):
     out_mask_path = os.path.join(case_dir, "predicted_seg.nii.gz")
     out_report_path = os.path.join(case_dir, "report.pdf")
 
-    weights_path = os.getenv("MODEL_WEIGHTS_PATH", "models/brats_mri_segmentation/models/model.ts")
-    if not os.path.exists(weights_path) and os.path.exists(weights_path.replace(".ts", ".pt")):
-        weights_path = weights_path.replace(".ts", ".pt")
+    weights_path = resolve_weights_path()
     device_name = os.getenv("MODEL_DEVICE", "cpu")
 
     # Mark case state as processing with start timestamp
@@ -746,7 +783,7 @@ def trigger_segmentation(case_id: str):
 
     start_time = time.time()
     try:
-        # Check if PyTorch and MONAI are available for deep learning execution
+        # Check if PyTorch, MONAI and model checkpoint are available for deep learning execution
         has_deep_learning = False
         try:
             import torch
@@ -755,34 +792,43 @@ def trigger_segmentation(case_id: str):
         except ImportError:
             has_deep_learning = False
 
-        if has_deep_learning:
-            # Run full SegResNet inference pipeline
+        resolved_weights = weights_path
+        has_checkpoint = os.path.exists(resolved_weights)
+
+        if has_deep_learning and has_checkpoint:
+            # Run genuine SegResNet inference pipeline
+            logger.info(f"[NeuroScope 3D] Executing real MONAI SegResNet inference for case {case_id} (weights: {resolved_weights})")
             run_pipeline(
                 t1=state["file_paths"]["t1"],
                 t1gd=state["file_paths"]["t1gd"],
                 t2=state["file_paths"]["t2"],
                 flair=state["file_paths"]["flair"],
                 output=out_mask_path,
-                weights=weights_path,
+                weights=resolved_weights,
                 device=device_name,
             )
+            execution_mode = "real_ai_inference"
+        elif has_deep_learning and not has_checkpoint:
+            raise FileNotFoundError(f"Pretrained model weights not found at '{resolved_weights}'")
         elif state.get("expert_mask_path") and os.path.exists(state["expert_mask_path"]):
-            # Graceful demonstration fallback for cloud tiers without PyTorch/GPU:
-            # Copy bundled ground-truth / reference segmentation to output mask
+            # Graceful demonstration fallback for environments without PyTorch/weights:
+            # Clearly labeled reference segmentation copy
             ensure_valid_gzipped_file(state["expert_mask_path"], out_mask_path)
             logger.info(
-                f"[NeuroScope 3D] PyTorch not detected in environment. Using bundled reference mask for case {case_id}."
+                f"[NeuroScope 3D] Deep learning weights unavailable. Using bundled reference mask for demonstration for case {case_id}."
             )
+            execution_mode = "demonstration_reference_mask_copy"
         else:
-            # High-fidelity deterministic fallback for cloud demonstration tiers where PyTorch is not provisioned
+            # Deterministic demonstration fallback for environments without PyTorch/weights
             logger.info(
-                f"[NeuroScope 3D] PyTorch not detected in cloud runtime. Executing deterministic contrast-enhancement fallback segmentation for case {case_id}."
+                f"[NeuroScope 3D] Deep learning weights unavailable. Executing deterministic demonstration fallback for case {case_id}."
             )
             generate_cloud_fallback_segmentation(
                 t1gd_path=state["file_paths"]["t1gd"],
                 flair_path=state["file_paths"]["flair"],
                 out_path=out_mask_path
             )
+            execution_mode = "demonstration_heuristic_fallback"
 
         infer_elapsed = time.time() - start_time
         eval_start = time.time()
@@ -839,15 +885,42 @@ def trigger_segmentation(case_id: str):
             "device": device_name,
         }
 
-        provenance = {
-            "model_name": "MONAI brats_mri_segmentation (SegResNet)",
-            "model_license": "Apache 2.0",
-            "training_data_source": "BraTS 2018 Multimodal Brain Tumor Dataset",
-            "git_commit": get_git_commit(),
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "input_sha256": input_sha256,
-            "timing_breakdown": timing_breakdown,
-        }
+        if execution_mode == "real_ai_inference":
+            provenance = {
+                "model_name": "MONAI brats_mri_segmentation (SegResNet)",
+                "execution_mode": "real_ai_inference",
+                "model_license": "Apache 2.0",
+                "training_data_source": "BraTS 2018 Multimodal Brain Tumor Dataset",
+                "checkpoint_file": os.path.basename(resolved_weights),
+                "git_commit": get_git_commit(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "input_sha256": input_sha256,
+                "timing_breakdown": timing_breakdown,
+            }
+        elif execution_mode == "demonstration_reference_mask_copy":
+            provenance = {
+                "model_name": "Demonstration Fallback (Reference Mask Copy)",
+                "execution_mode": "demonstration_reference_mask_copy",
+                "demonstration_notice": "Notice: Reference mask demonstrated because SegResNet checkpoint was unconfigured.",
+                "model_license": "Apache 2.0 (Demonstration)",
+                "training_data_source": "BraTS 2018 / 2021 Dev Reference",
+                "git_commit": get_git_commit(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "input_sha256": input_sha256,
+                "timing_breakdown": timing_breakdown,
+            }
+        else:
+            provenance = {
+                "model_name": "Demonstration Fallback (Heuristic Approximation)",
+                "execution_mode": "demonstration_heuristic_fallback",
+                "demonstration_notice": "Notice: Heuristic segmentation demonstrated because deep learning weights were unconfigured.",
+                "model_license": "Apache 2.0 (Demonstration)",
+                "training_data_source": "Heuristic Demonstration",
+                "git_commit": get_git_commit(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "input_sha256": input_sha256,
+                "timing_breakdown": timing_breakdown,
+            }
 
         report_start = time.time()
         # Generate PDF report
@@ -889,6 +962,7 @@ def trigger_segmentation(case_id: str):
         state["volumes"] = volumes
         state["case_evaluation"] = case_eval
         state["provenance"] = provenance
+        state["execution_mode"] = execution_mode
         state["mask_path"] = out_mask_path
         state["report_path"] = out_report_path
         save_case_metadata(case_id, state)
@@ -1059,6 +1133,8 @@ def get_case_results(case_id: str):
             report_url=f"/api/cases/{case_id}/report",
             agreement_mask_url=f"/api/cases/{case_id}/agreement-mask?region=WT" if state.get("expert_mask_path") else None,
             summary_url=f"/api/cases/{case_id}/summary",
+            probability_map_url=f"/api/cases/{case_id}/probabilities/max",
+            boundary_mask_url=f"/api/cases/{case_id}/boundary-mask",
         ),
         boundary_watch=state.get("boundary_watch"),
         disclaimer=MANDATORY_DISCLAIMER,
@@ -1232,6 +1308,180 @@ def download_agreement_mask(case_id: str, region: str = "WT"):
         filename=agr_filename,
         headers={
             "Content-Disposition": f'attachment; filename="{agr_filename}"'
+        }
+    )
+
+
+@router.api_route("/cases/{case_id}/probabilities", methods=["GET", "HEAD"])
+def get_probabilities_metadata(case_id: str):
+    """
+    Returns metadata regarding the availability of voxel-wise probability maps
+    from genuine SegResNet inference, including channel semantics and non-diagnostic disclaimers.
+    """
+    enforce_secure_case_id(case_id)
+    case_dir = get_case_dir(case_id)
+    state = load_case_metadata(case_id)
+    cohort_eval_dir = os.path.join("outputs", "real_cohort_eval")
+    has_cohort_case = (
+        os.path.exists(os.path.join(cohort_eval_dir, f"{case_id}_pred.nii.gz"))
+        or os.path.exists(os.path.join(cohort_eval_dir, f"{case_id}_prob_max.nii.gz"))
+        or os.path.exists(os.path.join("data", "real_cases", case_id))
+    )
+    if not state and not os.path.exists(case_dir) and not has_cohort_case:
+        raise HTTPException(status_code=404, detail="Case not found or expired.")
+
+    # Check for probability maps in case_dir or fallback outputs/real_cohort_eval
+    channels_found = []
+    for ch in ["wt", "tc", "et", "max"]:
+        p1 = os.path.join(case_dir, f"prob_{ch}.nii.gz")
+        p2 = os.path.join("outputs", "real_cohort_eval", f"{case_id}_prob_{ch}.nii.gz")
+        p3 = os.path.join("outputs", "real_cohort_eval", f"prob_{ch}.nii.gz")
+        if os.path.exists(p1) or os.path.exists(p2) or os.path.exists(p3):
+            channels_found.append(ch)
+
+    available = len(channels_found) > 0
+
+    return {
+        "case_id": case_id,
+        "available": available,
+        "channels": channels_found if available else [],
+        "channel_labels": {
+            "wt": "Whole Tumour (WT) Probability Map",
+            "tc": "Tumour Core (TC) Probability Map",
+            "et": "Enhancing Tumour (ET) Probability Map",
+            "max": "Composite Maximum Tumour Probability",
+        },
+        "semantics": {
+            "model_architecture": "MONAI SegResNet (brats_mri_segmentation)",
+            "activation_function": "Sigmoid (Voxel-wise, Independent Channels)",
+            "value_range": "[0.0, 1.0]",
+            "clinical_interpretation_warning": (
+                "Sigmoid probability maps represent raw deep learning network activations, "
+                "not calibrated patient cancer probabilities, diagnostic risk, or clinical certainty. "
+                "Do not use for diagnosis or treatment decisions."
+            ),
+        },
+        "disclaimer": MANDATORY_DISCLAIMER,
+    }
+
+
+@router.api_route("/cases/{case_id}/probabilities/{channel}", methods=["GET", "HEAD"])
+def download_probability_map(case_id: str, channel: str):
+    """
+    Streams the continuous sigmoid probability map (.nii.gz) for the specified subregion
+    ('wt', 'tc', 'et', or 'max'). Values are float32 in [0.0, 1.0] preserving NIfTI geometry.
+    """
+    enforce_secure_case_id(case_id)
+    case_dir = get_case_dir(case_id)
+    state = load_case_metadata(case_id)
+    cohort_eval_dir = os.path.join("outputs", "real_cohort_eval")
+    has_cohort_case = (
+        os.path.exists(os.path.join(cohort_eval_dir, f"{case_id}_pred.nii.gz"))
+        or os.path.exists(os.path.join(cohort_eval_dir, f"{case_id}_prob_max.nii.gz"))
+        or os.path.exists(os.path.join("data", "real_cases", case_id))
+    )
+    if not state and not os.path.exists(case_dir) and not has_cohort_case:
+        raise HTTPException(status_code=404, detail="Case not found or expired.")
+
+    ch_clean = channel.lower().strip()
+    if ch_clean not in ["wt", "tc", "et", "max"]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid probability channel '{channel}'. Allowed values: wt, tc, et, max."
+        )
+
+    # Search in case directory and real_cohort_eval
+    candidates = [
+        os.path.join(case_dir, f"prob_{ch_clean}.nii.gz"),
+        os.path.join("outputs", "real_cohort_eval", f"{case_id}_prob_{ch_clean}.nii.gz"),
+        os.path.join("outputs", "real_cohort_eval", f"prob_{ch_clean}.nii.gz"),
+    ]
+
+    prob_path = None
+    for cand in candidates:
+        if os.path.exists(cand):
+            prob_path = cand
+            break
+
+    if not prob_path or not os.path.exists(prob_path):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(
+                f"Probability map '{ch_clean}' is not available for case '{case_id}'. "
+                "Genuine SegResNet model inference must be executed to produce voxel-wise probabilities."
+            )
+        )
+
+    filename = f"{case_id}_prob_{ch_clean}.nii.gz"
+    return FileResponse(
+        prob_path,
+        media_type="application/gzip",
+        filename=filename,
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"'
+        }
+    )
+
+
+@router.api_route("/cases/{case_id}/boundary-mask", methods=["GET", "HEAD"])
+def download_boundary_mask(case_id: str):
+    """
+    Streams the discrete boundary contour mask (0=transparent, 1=TC, 2=WT, 4=ET)
+    used for the Combined visualization mode.
+    """
+    enforce_secure_case_id(case_id)
+    case_dir = get_case_dir(case_id)
+    state = load_case_metadata(case_id)
+    cohort_eval_dir = os.path.join("outputs", "real_cohort_eval")
+    has_cohort_case = (
+        os.path.exists(os.path.join(cohort_eval_dir, f"{case_id}_pred.nii.gz"))
+        or os.path.exists(os.path.join(cohort_eval_dir, f"{case_id}_prob_max.nii.gz"))
+        or os.path.exists(os.path.join("data", "real_cases", case_id))
+    )
+    if not state and not os.path.exists(case_dir) and not has_cohort_case:
+        raise HTTPException(status_code=404, detail="Case not found or expired.")
+
+    boundary_path = os.path.join(case_dir, "boundary_seg.nii.gz")
+    if not os.path.exists(boundary_path):
+        cand = os.path.join("outputs", "real_cohort_eval", f"{case_id}_boundary.nii.gz")
+        if os.path.exists(cand):
+            boundary_path = cand
+        else:
+            cand2 = os.path.join("outputs", "real_cohort_eval", "boundary_seg.nii.gz")
+            if os.path.exists(cand2):
+                boundary_path = cand2
+
+    if not os.path.exists(boundary_path):
+        pred_mask_path = os.path.join(case_dir, "predicted_seg.nii.gz")
+        if not os.path.exists(pred_mask_path):
+            pred_cand = os.path.join("outputs", "real_cohort_eval", f"{case_id}_pred.nii.gz")
+            if os.path.exists(pred_cand):
+                pred_mask_path = pred_cand
+
+        if os.path.exists(pred_mask_path):
+            try:
+                pred_nii = nib.load(pred_mask_path)
+                pred_data = np.asanyarray(pred_nii.dataobj).astype(np.uint8)
+                boundary_data = generate_boundary_map(pred_data)
+                b_nii = nib.Nifti1Image(boundary_data, affine=pred_nii.affine, header=pred_nii.header)
+                b_nii.set_data_dtype(np.uint8)
+                nib.save(b_nii, boundary_path)
+            except Exception as e:
+                logger.warning(f"Dynamic boundary mask generation failed: {e}")
+
+    if not os.path.exists(boundary_path):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Segmentation boundary mask not found for case '{case_id}'. Run segmentation first."
+        )
+
+    filename = f"{case_id}_boundary_seg.nii.gz"
+    return FileResponse(
+        boundary_path,
+        media_type="application/gzip",
+        filename=filename,
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"'
         }
     )
 
@@ -1817,12 +2067,19 @@ def get_case_boundary_watch(case_id: str):
             "disclaimer": MANDATORY_DISCLAIMER
         }
 
-    pred_nii = nib.load(mask_path)
-    pred_data = np.asanyarray(pred_nii.dataobj).astype(np.uint8)
-    sp = state.get("spatial_metadata", {}).get("spacing_mm", [1.0, 1.0, 1.0])
-    bw_result = analyze_boundary_watch(pred_data, voxel_spacing=tuple(sp), affine=pred_nii.affine)
-    state["boundary_watch"] = bw_result
-    save_case_metadata(case_id, state)
+    try:
+        pred_nii = nib.load(mask_path)
+        pred_data = np.asanyarray(pred_nii.dataobj).astype(np.uint8)
+        sp = state.get("spatial_metadata", {}).get("spacing_mm", [1.0, 1.0, 1.0])
+        bw_result = analyze_boundary_watch(pred_data, voxel_spacing=tuple(sp), affine=pred_nii.affine)
+        state["boundary_watch"] = bw_result
+        save_case_metadata(case_id, state)
+    except Exception as e:
+        logger.error(f"[NeuroScope 3D] Boundary Watch computation failed for case {case_id}: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Boundary Watch analysis failed: {str(e)}"
+        )
 
     return {
         "case_id": case_id,

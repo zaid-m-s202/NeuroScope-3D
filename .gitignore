@@ -54,6 +54,7 @@ models/*.bin
 models/*.onnx
 *.pth
 *.pt
+*_backup.ts
 models/**/model_base_pretrained.ts
 *_base_pretrained.ts
 

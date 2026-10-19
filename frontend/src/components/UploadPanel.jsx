@@ -37,17 +37,51 @@ export default function UploadPanel({
   onCaseUploaded,
   onSegmentationCompleted,
   onBaseScanSelected,
-  onValidationError
+  onValidationError,
+  files: externalFiles,
+  onFilesChange,
+  uploadResult: externalUploadResult,
+  onUploadResultChange,
+  activeCase,
 }) {
-  const [files, setFiles] = useState({
+  const [internalFiles, setInternalFiles] = useState({
     t1: null, t1gd: null, t2: null, flair: null, expert_mask: null,
   });
+  const [internalUploadResult, setInternalUploadResult] = useState(null);
+
+  const files = externalFiles !== undefined ? externalFiles : internalFiles;
+  const setFiles = useCallback((updater) => {
+    if (onFilesChange) {
+      if (typeof updater === 'function') {
+        onFilesChange((prev) => updater(prev || files));
+      } else {
+        onFilesChange(updater);
+      }
+    } else {
+      setInternalFiles(updater);
+    }
+  }, [onFilesChange, files]);
+
+  const uploadResult = externalUploadResult !== undefined
+    ? externalUploadResult
+    : (internalUploadResult || activeCase || null);
+
+  const setUploadResult = useCallback((updater) => {
+    if (onUploadResultChange) {
+      if (typeof updater === 'function') {
+        onUploadResultChange((prev) => updater(prev || uploadResult));
+      } else {
+        onUploadResultChange(updater);
+      }
+    } else {
+      setInternalUploadResult(updater);
+    }
+  }, [onUploadResultChange, uploadResult]);
 
   // Tracks which sequence is being manually re-assigned via drag
   const [pendingAssign, setPendingAssign] = useState(null);   // file waiting for slot click
   const [conflicts, setConflicts]         = useState([]);     // [{file, detectedAs, existingAs}]
   const [warnings, setWarnings]           = useState([]);
-  const [uploadResult, setUploadResult]   = useState(null);   // validated CaseUploadResponse
   const [isUploading, setIsUploading]     = useState(false);
   const [isSegmenting, setIsSegmenting]   = useState(false);
   const [errorMessage, setErrorMessage]   = useState(null);
@@ -150,7 +184,18 @@ export default function UploadPanel({
     const updated = { ...files, [seqId]: file };
     setFiles(updated);
     setErrorMessage(null);
-    setUploadResult(null);
+    if (uploadResult) {
+      setUploadResult({
+        ...uploadResult,
+        validation_status: 'pending',
+        files: {
+          ...uploadResult.files,
+          [seqId]: { filename: file.name, size_bytes: file.size }
+        }
+      });
+    } else {
+      setUploadResult(null);
+    }
 
     if (seqId === 't1gd' && file) onBaseScanSelected(file);
     else if (seqId === 't1' && file && !files.t1gd) onBaseScanSelected(file);
@@ -158,7 +203,17 @@ export default function UploadPanel({
 
   const handleRemoveFile = (seqId) => {
     setFiles(prev => ({ ...prev, [seqId]: null }));
-    setUploadResult(null);
+    if (uploadResult?.files) {
+      const updatedFiles = { ...uploadResult.files };
+      delete updatedFiles[seqId];
+      setUploadResult({
+        ...uploadResult,
+        files: updatedFiles,
+        validation_status: 'pending',
+      });
+    } else {
+      setUploadResult(null);
+    }
     setErrorMessage(null);
   };
 
@@ -243,7 +298,7 @@ export default function UploadPanel({
   // ── Run segmentation ─────────────────────────────────────────────────────
   const handleRunSegmentation = async () => {
     let currentCase = uploadResult;
-    if (!currentCase?.case_id) {
+    if (!currentCase?.case_id || currentCase?.validation_status !== 'passed') {
       currentCase = await handleUpload();
       if (!currentCase?.case_id) return;
     }
@@ -282,11 +337,17 @@ export default function UploadPanel({
   }
 
   // ── Derived state ────────────────────────────────────────────────────────
-  const requiredReady  = ['t1', 't1gd', 't2', 'flair'].every(k => files[k] !== null);
-  const validationPassed = uploadResult?.validation_status === 'passed';
+  const assignedCount = ['t1', 't1gd', 't2', 'flair'].filter(
+    k => files[k] || uploadResult?.files?.[k]?.filename || uploadResult?.files?.[k]?.present
+  ).length;
+  const requiredReady  = ['t1', 't1gd', 't2', 'flair'].every(
+    k => files[k] !== null || uploadResult?.files?.[k]?.filename || uploadResult?.files?.[k]?.present
+  );
+  const validationPassed = uploadResult?.validation_status === 'passed' ||
+    (uploadResult?.status === 'completed' && ['t1', 't1gd', 't2', 'flair'].every(k => uploadResult?.files?.[k]));
   const segButtonReady = !isUploading && !isSegmenting;
 
-  const spatialMeta = uploadResult?.spatial_summary;
+  const spatialMeta = uploadResult?.spatial_summary || uploadResult?.spatial_metadata;
 
   return (
     <section style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
@@ -296,7 +357,7 @@ export default function UploadPanel({
           Study Ingestion &amp; Upload
         </h2>
         <span className="font-mono" style={{ fontSize: '11px', color: 'var(--on-surface-variant)' }}>
-          {['t1', 't1gd', 't2', 'flair'].filter(k => files[k]).length}/4
+          {assignedCount}/4
           {validationPassed ? ' ✓ VALIDATED' : requiredReady ? ' READY' : ' PENDING'}
         </span>
       </div>
@@ -493,9 +554,11 @@ export default function UploadPanel({
                 </label>
 
                 {/* Remove button */}
-                {isAssigned && !validationPassed && (
+                {isAssigned && (
                   <button
                     title="Remove this file"
+                    aria-label={`Remove ${spec.label}`}
+                    className="remove-seq-btn"
                     style={{
                       background: 'none', border: 'none', cursor: 'pointer',
                       color: 'var(--on-surface-variant)', padding: '2px',
@@ -604,7 +667,7 @@ export default function UploadPanel({
           fontSize: '10px', color: 'var(--outline)',
           display: 'flex', gap: '4px', flexWrap: 'wrap'
         }}>
-          {['t1', 't1gd', 't2', 'flair'].filter(k => !files[k]).map(k => (
+          {['t1', 't1gd', 't2', 'flair'].filter(k => !files[k] && !uploadResult?.files?.[k]?.filename && !uploadResult?.files?.[k]?.present).map(k => (
             <span key={k} style={{
               border: '1px dashed var(--outline)',
               borderRadius: 'var(--radius-xs)',

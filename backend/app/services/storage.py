@@ -16,7 +16,7 @@ STORAGE_BASE_DIR = os.getenv("STORAGE_DIR", "./storage/cases")
 RETENTION_HOURS = int(os.getenv("TEMP_RETENTION_HOURS", "24"))
 
 
-VALID_CASE_ID_PATTERN = re.compile(r"^case_[a-zA-Z0-9_\-]+$")
+VALID_CASE_ID_PATTERN = re.compile(r"^(case_|BraTS)[a-zA-Z0-9_\-]+$")
 
 
 def compute_file_sha256(file_path: str) -> str:

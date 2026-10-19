@@ -10,6 +10,7 @@ import sys
 import time
 import numpy as np
 import nibabel as nib
+from typing import Dict, Any, Tuple, Optional
 
 from inference.preprocessing import preprocess_study, PreprocessingError
 from inference.postprocessing import (
@@ -261,10 +262,118 @@ def run_pipeline(
     out_nii.set_data_dtype(np.uint8)
     nib.save(out_nii, output)
 
+    # 8. Compute and Save Voxel-wise Probability Maps & Boundary Contours
+    save_probability_and_boundary_maps(
+        raw_channels=raw_channels,
+        label_map=restored_labels,
+        meta=meta,
+        output_dir=output_dir,
+    )
+
     elapsed = time.time() - start_time
     print(f"[NeuroScope 3D] Output successfully saved to: {output}")
     print(f"[NeuroScope 3D] Pipeline finished in {elapsed:.2f} seconds.")
     return output
+
+
+def generate_boundary_map(label_map: np.ndarray) -> np.ndarray:
+    """
+    Computes boundary contours for BraTS regions from a discrete label map:
+    - Label 2 (ED / WT contour) on Whole Tumour boundary
+    - Label 1 (NCR / TC contour) on Tumour Core boundary
+    - Label 4 (ET contour) on Enhancing Tumour boundary
+    Non-boundary and background voxels remain 0 (transparent).
+    """
+    import scipy.ndimage
+    wt_mask = (label_map > 0)
+    tc_mask = (label_map == 1) | (label_map == 4)
+    et_mask = (label_map == 4)
+
+    wt_bound = wt_mask ^ scipy.ndimage.binary_erosion(wt_mask)
+    tc_bound = tc_mask ^ scipy.ndimage.binary_erosion(tc_mask)
+    et_bound = et_mask ^ scipy.ndimage.binary_erosion(et_mask)
+
+    boundary = np.zeros_like(label_map, dtype=np.uint8)
+    boundary[wt_bound] = 2
+    boundary[tc_bound] = 1
+    boundary[et_bound] = 4
+    return boundary
+
+
+def save_probability_and_boundary_maps(
+    raw_channels: np.ndarray,
+    label_map: np.ndarray,
+    meta: Dict[str, Any],
+    output_dir: str,
+) -> Dict[str, str]:
+    """
+    Computes genuine voxel-wise sigmoid probability maps from MONAI SegResNet
+    raw channels:
+      Channel 0: TC (Tumor Core)
+      Channel 1: WT (Whole Tumor)
+      Channel 2: ET (Enhancing Tumor)
+    Also computes composite maximum probability and boundary contours.
+    Saves NIfTI files (.nii.gz) in output_dir:
+      - prob_wt.nii.gz: Whole Tumour sigmoid probability map
+      - prob_tc.nii.gz: Tumour Core sigmoid probability map
+      - prob_et.nii.gz: Enhancing Tumour sigmoid probability map
+      - prob_max.nii.gz: Composite maximum probability map
+      - boundary_seg.nii.gz: Crisp boundary contours
+    """
+    if not output_dir:
+        return {}
+    os.makedirs(output_dir, exist_ok=True)
+
+    ref_affine = meta.get("ref_affine_np")
+    if ref_affine is None:
+        ref_affine = np.eye(4)
+    ref_header = meta.get("ref_header")
+
+    # Sigmoid activation on raw model output channels
+    probs = 1.0 / (1.0 + np.exp(-np.clip(raw_channels, -30.0, 30.0)))
+    original_shape = tuple(meta.get("original_shape", raw_channels.shape[1:]))
+
+    # Resample continuous probabilities to original reference grid if needed
+    if probs.shape[1:] != original_shape:
+        from scipy.ndimage import zoom
+        zoom_factors = [original_shape[i] / float(probs.shape[1 + i]) for i in range(3)]
+        prob_tc = zoom(probs[0], zoom=zoom_factors, order=1, mode="nearest", prefilter=False).astype(np.float32)
+        prob_wt = zoom(probs[1], zoom=zoom_factors, order=1, mode="nearest", prefilter=False).astype(np.float32)
+        prob_et = zoom(probs[2], zoom=zoom_factors, order=1, mode="nearest", prefilter=False).astype(np.float32)
+    else:
+        prob_tc = probs[0].astype(np.float32)
+        prob_wt = probs[1].astype(np.float32)
+        prob_et = probs[2].astype(np.float32)
+
+    prob_max = np.maximum.reduce([prob_wt, prob_tc, prob_et]).astype(np.float32)
+
+    prob_maps = {
+        "wt": prob_wt,
+        "tc": prob_tc,
+        "et": prob_et,
+        "max": prob_max,
+    }
+
+    saved = {}
+    for ch_name, p_arr in prob_maps.items():
+        out_path = os.path.join(output_dir, f"prob_{ch_name}.nii.gz")
+        p_nii = nib.Nifti1Image(p_arr, affine=ref_affine, header=ref_header)
+        p_nii.set_data_dtype(np.float32)
+        nib.save(p_nii, out_path)
+        saved[ch_name] = out_path
+
+    # Save boundary mask
+    try:
+        boundary_arr = generate_boundary_map(label_map)
+        b_path = os.path.join(output_dir, "boundary_seg.nii.gz")
+        b_nii = nib.Nifti1Image(boundary_arr, affine=ref_affine, header=ref_header)
+        b_nii.set_data_dtype(np.uint8)
+        nib.save(b_nii, b_path)
+        saved["boundary"] = b_path
+    except Exception as e:
+        print(f"[NeuroScope 3D Warning] Failed to save boundary mask: {e}")
+
+    return saved
 
 
 def main():

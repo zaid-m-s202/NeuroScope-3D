@@ -8,6 +8,10 @@ Exports GLTF binary (.glb) and Wavefront (.obj) models for interactive 3D WebGL 
 from typing import Tuple, Dict, Any, Optional
 import io
 import numpy as np
+if not hasattr(np, "long"):
+    np.long = int
+if not hasattr(np, "ulong"):
+    np.ulong = int
 import scipy.ndimage
 from skimage.measure import marching_cubes
 import trimesh

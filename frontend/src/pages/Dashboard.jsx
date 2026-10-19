@@ -35,6 +35,10 @@ export default function Dashboard({
   onValidationError,
   workstationSubTab = 'viewer',
   onWorkstationSubTabChange,
+  ingestionFiles,
+  onIngestionFilesChange,
+  uploadResult,
+  onUploadResultChange,
 }) {
   const [selectedCentroid, setSelectedCentroid] = useState(null);
   const [overlayMode, setOverlayMode] = useState('prediction'); // 'prediction' | 'agreement'
@@ -195,6 +199,7 @@ export default function Dashboard({
             agreementRegion={agreementRegion}
             onSetOverlayMode={setOverlayMode}
             onSetAgreementRegion={setAgreementRegion}
+            spatialMetadata={caseResults?.spatial_metadata || activeCase?.spatial_summary || activeCase?.spatial_metadata}
           />
         </div>
       </main>
@@ -224,64 +229,69 @@ export default function Dashboard({
 
           {/* Side Panel Body */}
           <div className="side-panel-scrollable-body">
-            {sidePanelTab === 'quant' ? (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
-                <VolumetricCards
-                  volumes={effectiveVolumes}
-                  spatialMetadata={caseResults?.spatial_metadata || activeCase?.spatial_summary}
-                  onSelectCentroid={(vox) => {
-                    setSelectedCentroid([...vox]);
+            <div style={{ display: sidePanelTab === 'quant' ? 'flex' : 'none', flexDirection: 'column', gap: '14px' }}>
+              <VolumetricCards
+                volumes={effectiveVolumes}
+                spatialMetadata={caseResults?.spatial_metadata || activeCase?.spatial_summary}
+                onSelectCentroid={(vox) => {
+                  setSelectedCentroid([...vox]);
+                }}
+                layerVisibility={layerVisibility}
+                onToggleLayer={handleToggleLayer}
+                onRunSegmentation={handleCalculateVolumes}
+                onLoadSample={handleLoadSampleDirect}
+                isSegmenting={isSegmenting}
+                caseId={effectiveCaseId}
+              />
+
+              {caseResults && (
+                <BoundaryWatchPanel
+                  caseId={caseResults.case_id}
+                  boundaryWatchData={caseResults.boundary_watch}
+                  onNavigateToCentroid={(coords) => {
+                    setSelectedCentroid([...coords]);
                   }}
-                  layerVisibility={layerVisibility}
-                  onToggleLayer={handleToggleLayer}
-                  onRunSegmentation={handleCalculateVolumes}
-                  onLoadSample={handleLoadSampleDirect}
-                  isSegmenting={isSegmenting}
-                  caseId={effectiveCaseId}
-                />
-
-                {caseResults && (
-                  <BoundaryWatchPanel
-                    caseId={caseResults.case_id}
-                    boundaryWatchData={caseResults.boundary_watch}
-                    onNavigateToCentroid={(coords) => {
-                      setSelectedCentroid([...coords]);
-                    }}
-                    onNavigateToSlice={(sliceZ) => {
-                      const currentX = selectedCentroid?.[0] ?? 32;
-                      const currentY = selectedCentroid?.[1] ?? 32;
-                      setSelectedCentroid([currentX, currentY, sliceZ]);
-                    }}
-                  />
-                )}
-
-                <EvaluationPanel
-                  caseId={effectiveCaseId}
-                  evaluation={caseResults?.case_evaluation}
-                  benchmarkReference={caseResults?.held_out_benchmark_reference}
-                  volumes={effectiveVolumes}
-                  onExpertMaskUploaded={handleExpertMaskUploaded}
-                  onActivateAgreementLens={(reg) => {
-                    handleActivateAgreementLens(reg);
+                  onNavigateToSlice={(sliceZ) => {
+                    const currentX = selectedCentroid?.[0] ?? 32;
+                    const currentY = selectedCentroid?.[1] ?? 32;
+                    setSelectedCentroid([currentX, currentY, sliceZ]);
                   }}
                 />
+              )}
 
-                {caseResults && (
-                  <DownloadsPanel
-                    caseId={caseResults.case_id}
-                    provenance={caseResults.provenance}
-                    caseResults={caseResults}
-                  />
-                )}
-              </div>
-            ) : (
+              <EvaluationPanel
+                caseId={effectiveCaseId}
+                evaluation={caseResults?.case_evaluation}
+                benchmarkReference={caseResults?.held_out_benchmark_reference}
+                volumes={effectiveVolumes}
+                onExpertMaskUploaded={handleExpertMaskUploaded}
+                onActivateAgreementLens={(reg) => {
+                  handleActivateAgreementLens(reg);
+                }}
+              />
+
+              {caseResults && (
+                <DownloadsPanel
+                  caseId={caseResults.case_id}
+                  provenance={caseResults.provenance}
+                  caseResults={caseResults}
+                />
+              )}
+            </div>
+
+            <div style={{ display: sidePanelTab === 'upload' ? 'block' : 'none' }}>
               <UploadPanel
                 onCaseUploaded={onCaseUploaded}
                 onSegmentationCompleted={onSegmentationCompleted}
                 onBaseScanSelected={onBaseScanSelected}
                 onValidationError={onValidationError}
+                files={ingestionFiles}
+                onFilesChange={onIngestionFilesChange}
+                uploadResult={uploadResult}
+                onUploadResultChange={onUploadResultChange}
+                activeCase={activeCase}
               />
-            )}
+            </div>
           </div>
         </aside>
       )}

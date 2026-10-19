@@ -171,6 +171,24 @@ export function getAgreementMaskUrl(caseId, region = 'WT') {
   return `${API_BASE}/api/cases/${caseId}/agreement-mask?region=${encodeURIComponent(region)}`;
 }
 
+export function getProbabilityMapUrl(caseId, channel = 'max') {
+  return `${API_BASE}/api/cases/${caseId}/probabilities/${encodeURIComponent(channel)}`;
+}
+
+export function getBoundaryMaskUrl(caseId) {
+  return `${API_BASE}/api/cases/${caseId}/boundary-mask`;
+}
+
+export async function getProbabilityMetadata(caseId) {
+  try {
+    const res = await fetch(`${API_BASE}/api/cases/${caseId}/probabilities`);
+    if (!res.ok) return { available: false };
+    return await res.json();
+  } catch (_) {
+    return { available: false };
+  }
+}
+
 /**
  * Initiates binary download of the 4-class expert agreement NIfTI volume (TP/FP/FN).
  */

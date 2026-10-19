@@ -13,7 +13,6 @@ scikit-image>=0.22.0
 trimesh>=4.0.0
 pydicom>=2.4.0
 
-# Inference dependencies (Installed and verified on target GPU / inference branch)
-# torch>=2.1.0
-# torchvision>=0.16.0
-# monai>=1.3.0
+# Inference dependencies
+torch>=2.1.0
+monai>=1.3.0

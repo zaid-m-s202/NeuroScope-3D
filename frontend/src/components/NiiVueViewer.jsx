@@ -1,8 +1,29 @@
-import React, { useEffect, useRef, useState } from 'react';
-import { Niivue, NVImage } from '@niivue/niivue';
+import React, { useEffect, useRef, useState, useCallback } from 'react';
+import { Niivue, NVImage, cmapper } from '@niivue/niivue';
 import * as nifti from 'nifti-reader-js';
-import { Eye, Check, Layers, Sliders, Target, RotateCcw } from 'lucide-react';
-import { getAgreementMaskUrl, getMaskDownloadUrl } from '../services/api';
+import { Eye, Check, Layers, Sliders, Target, RotateCcw, Activity } from 'lucide-react';
+import { getAgreementMaskUrl, getMaskDownloadUrl, getProbabilityMapUrl, getBoundaryMaskUrl, getProbabilityMetadata } from '../services/api';
+import { voxelToWorld, normalizeAffine, getAnatomicalOrientation } from '../utils/coordinates';
+
+// Medical Imaging Heat Map Color Scale:
+// 0.00: Transparent (Background healthy brain)
+// 0.10: Dark Blue (very low predicted probability)
+// 0.30: Cyan (low-to-moderate probability)
+// 0.55: Green/Yellow (moderate-to-high probability)
+// 0.85: Orange/Red (high predicted probability)
+const MEDICAL_HEATMAP_CMAP = {
+  R: [0,   0,   0,   0, 255, 255, 230],
+  G: [0,  20, 210, 230, 215,  80,  20],
+  B: [0, 150, 255,  30,   0,   0,  20],
+  A: [0,  80, 140, 180, 210, 235, 255],
+  I: [0,  25,  75, 130, 185, 225, 255]
+};
+
+if (cmapper && typeof cmapper.addColormap === 'function') {
+  try {
+    cmapper.addColormap('medical_heatmap', MEDICAL_HEATMAP_CMAP);
+  } catch (_) {}
+}
 
 function updateMaskLut(maskVol, mode, reg, layers, opacity) {
   if (!maskVol) return;
@@ -21,8 +42,38 @@ function updateMaskLut(maskVol, mode, reg, layers, opacity) {
       maskVol.setColormapLabel(agreementLut);
     }
     maskVol.opacity = opacity;
+  } else if (mode === 'heatmap') {
+    // Continuous probability heat map with smooth color gradient
+    maskVol.colormapLabel = null;
+    maskVol.colormap = 'medical_heatmap';
+    maskVol.cal_min = 0.01;
+    maskVol.cal_max = 1.0;
+    maskVol.opacity = opacity;
+  } else if (mode === 'boundary') {
+    // Discrete boundary contour lines (1-voxel thickness for crisp delineation)
+    const showWT = layers?.WT ?? true;
+    const showTC = layers?.TC ?? true;
+    const showET = layers?.ET ?? true;
+    const boundaryLut = {
+      R: [0,   6,  34, 0, 250],
+      G: [0, 182, 197, 0, 204],
+      B: [0, 212,  94, 0,  21],
+      A: [
+        0,                                 // 0: BG transparent
+        showTC ? 255 : 0,                  // 1: TC contour (Cyan)
+        showWT ? 255 : 0,                  // 2: WT contour (Emerald Green)
+        0,                                 // 3: Unused
+        showET ? 255 : 0,                  // 4: ET contour (Electric Gold)
+      ],
+      I: [0, 1, 2, 3, 4],
+      labels: ['Background', 'TC Boundary', 'WT Boundary', 'Unused', 'ET Boundary'],
+    };
+    if (typeof maskVol.setColormapLabel === 'function') {
+      maskVol.setColormapLabel(boundaryLut);
+    }
+    maskVol.opacity = 1.0;
   } else {
-    // BraTS 2021 labels:
+    // BraTS 2021 labels (Segmentation mode):
     // 0: Background (100% transparent)
     // 1: Necrotic Core (NCR) -> part of WT, TC
     // 2: Edema (ED) -> part of WT
@@ -79,6 +130,7 @@ export default function NiiVueViewer({
   onSetAgreementRegion: propOnSetAgreementRegion,
   caseResults,
   activeCase,
+  spatialMetadata,
 }) {
   const canvasRef = useRef(null);
   const nvRef = useRef(null);
@@ -90,8 +142,10 @@ export default function NiiVueViewer({
   const [overlayOpacity, setOverlayOpacity] = useState(0.75);
   const [wlPreset, setWlPreset] = useState('Brain');
   const [statusMessage, setStatusMessage] = useState('Standby • Ready for multi-sequence MRI study');
-  const [internalOverlayMode, setInternalOverlayMode] = useState('prediction'); // 'prediction' | 'agreement'
+  const [internalOverlayMode, setInternalOverlayMode] = useState('prediction'); // 'prediction' | 'heatmap' | 'combined' | 'agreement'
   const [internalAgreementRegion, setInternalAgreementRegion] = useState('WT'); // 'WT' | 'TC' | 'ET'
+  const [probChannel, setProbChannel] = useState('max'); // 'max' | 'wt' | 'tc' | 'et'
+  const [hasProbabilities, setHasProbabilities] = useState(true);
   const [baseLoadedCount, setBaseLoadedCount] = useState(0);
 
   const overlayMode = propOverlayMode || internalOverlayMode;
@@ -113,6 +167,25 @@ export default function NiiVueViewer({
     }
   };
 
+  // Inspect probability availability for current active case
+  useEffect(() => {
+    if (!caseId) return;
+    let isCancelled = false;
+    getProbabilityMetadata(caseId)
+      .then((meta) => {
+        if (!isCancelled) {
+          setHasProbabilities(meta?.available === true);
+        }
+      })
+      .catch(() => {
+        if (!isCancelled) {
+          setHasProbabilities(false);
+        }
+      });
+    return () => {
+      isCancelled = true;
+    };
+  }, [caseId]);
 
   const [internalLayerVisibility, setInternalLayerVisibility] = useState({
     WT: true,
@@ -148,6 +221,60 @@ export default function NiiVueViewer({
     }
   };
 
+  // Comprehensive Reset View action: restores multiplanar, camera, crosshair, opacity, and Brain W/L
+  const handleResetView = () => {
+    const nv = nvRef.current;
+    if (!nv || !isViewerReady) return;
+    try {
+      if (typeof nv.resetScene === 'function') {
+        nv.resetScene();
+      }
+      handleSliceTypeChange('multi');
+      setOverlayOpacity(0.75);
+      setWlPreset('Brain');
+      applyWlPreset('Brain');
+      if (suggestedCrosshair && Array.isArray(suggestedCrosshair) && suggestedCrosshair.length >= 3) {
+        navigateToCentroid(suggestedCrosshair);
+      } else if (typeof nv.vox2frac === 'function' && volumeDims) {
+        const center = volumeDims.map((d) => Math.floor(d / 2));
+        nv.scene.crosshairPos = nv.vox2frac(center, 0);
+      }
+      nv.updateGLVolume();
+      setStatusMessage('View reset: Multiplanar orientation, canonical camera, Brain W/L (75% opacity) restored');
+    } catch (e) {
+      console.warn('Reset view failed:', e.message);
+    }
+  };
+
+  const getActiveAffine = useCallback(() => {
+    const metaAff = spatialMetadata?.reference_affine
+      || spatialMetadata?.affine
+      || caseResults?.spatial_metadata?.reference_affine
+      || caseResults?.spatial_metadata?.affine
+      || activeCase?.spatial_metadata?.reference_affine
+      || activeCase?.spatial_summary?.reference_affine;
+
+    const spacing = spatialMetadata?.spacing_mm
+      || caseResults?.spatial_metadata?.spacing_mm
+      || activeCase?.spatial_metadata?.spacing_mm
+      || activeCase?.spatial_summary?.spacing_mm
+      || [1.0, 1.0, 1.0];
+
+    if (metaAff) {
+      return normalizeAffine(metaAff, spacing);
+    }
+
+    const nv = nvRef.current;
+    if (nv && nv.volumes && nv.volumes.length > 0) {
+      const vol = nv.volumes[0];
+      if (vol.hdr?.affine) return normalizeAffine(vol.hdr.affine, spacing);
+      if (vol.matRAS) return normalizeAffine(vol.matRAS, spacing);
+      if (vol.hdr?.sform) return normalizeAffine(vol.hdr.sform, spacing);
+    }
+
+    return normalizeAffine(null, spacing);
+  }, [spatialMetadata, caseResults, activeCase]);
+
   // Navigate crosshair to specific voxel indices and synchronize all views
   const navigateToCentroid = (coords) => {
     const nv = nvRef.current;
@@ -156,14 +283,27 @@ export default function NiiVueViewer({
     if (!target || !Array.isArray(target) || target.length < 3) return;
 
     try {
+      const targetVox = [
+        Math.round(Number(target[0]) || 0),
+        Math.round(Number(target[1]) || 0),
+        Math.round(Number(target[2]) || 0),
+      ];
+      const aff = getActiveAffine();
+      const worldMm = voxelToWorld(targetVox, aff);
+
       if (typeof nv.vox2frac === 'function') {
-        const frac = nv.vox2frac(target, 0);
-        nv.scene.crosshairPos = frac;
-        nv.updateGLVolume();
-        if (typeof nv.createOnLocationChange === 'function') {
-          nv.createOnLocationChange();
+        const frac = nv.vox2frac(targetVox, 0);
+        if (frac && Array.isArray(frac) && frac.every((v) => Number.isFinite(v))) {
+          nv.scene.crosshairPos = frac;
+          nv.updateGLVolume();
         }
       }
+
+      setCrosshairPos({
+        vox: targetVox,
+        mm: worldMm,
+        val: 0,
+      });
     } catch (e) {
       console.warn('Centroid navigation failed:', e.message);
     }
@@ -195,11 +335,18 @@ export default function NiiVueViewer({
 
         // Crosshair location updates synchronized across multiplanar views
         nv.onLocationChange = (data) => {
-          if (data && data.vox && data.mm) {
+          if (data && data.vox && Array.isArray(data.vox) && data.vox.length >= 3) {
+            const vx = Math.round(Number(data.vox[0]) || 0);
+            const vy = Math.round(Number(data.vox[1]) || 0);
+            const vz = Math.round(Number(data.vox[2]) || 0);
+            const vox = [vx, vy, vz];
+            const aff = getActiveAffine();
+            const worldMm = voxelToWorld(vox, aff);
+
             setCrosshairPos({
-              vox: data.vox.map((v) => Math.round(v)),
-              mm: data.mm.map((m) => Number(m.toFixed(1))),
-              val: data.values && data.values.length > 0 ? data.values[0] : 0,
+              vox,
+              mm: worldMm,
+              val: data.values && data.values.length > 0 ? (Number(data.values[0]) || 0) : 0,
             });
           }
         };
@@ -253,8 +400,8 @@ export default function NiiVueViewer({
         }
         if (isCancelled || !volume) return;
 
-        // Preserve existing segmentation or agreement overlay if already mounted
-        const existingOverlay = (nv.volumes && nv.volumes.length > 1) ? nv.volumes[1] : null;
+        // Preserve existing overlays (segmentation, heatmap, or combined boundaries)
+        const existingOverlays = (nv.volumes && nv.volumes.length > 1) ? nv.volumes.slice(1) : [];
 
         while (nv.volumes && nv.volumes.length > 0) {
           nv.removeVolumeByIndex(0);
@@ -265,10 +412,20 @@ export default function NiiVueViewer({
           volume.cal_min = volume.robust_min;
           volume.cal_max = Math.max(volume.robust_max * 1.05, volume.robust_min + 1.0);
         }
-        if (existingOverlay) {
-          nv.addVolume(existingOverlay);
-          updateMaskLut(existingOverlay, overlayMode, agreementRegion, layerVisibility, overlayOpacity);
-          nv.setOpacity(1, overlayOpacity);
+        for (let i = 0; i < existingOverlays.length; i++) {
+          const ov = existingOverlays[i];
+          nv.addVolume(ov);
+          const volIdx = nv.volumes.length - 1;
+          if (overlayMode === 'combined' && i === 1) {
+            updateMaskLut(ov, 'boundary', agreementRegion, layerVisibility, 1.0);
+            nv.setOpacity(volIdx, 1.0);
+          } else if (overlayMode === 'heatmap' || (overlayMode === 'combined' && i === 0)) {
+            updateMaskLut(ov, 'heatmap', agreementRegion, layerVisibility, overlayOpacity);
+            nv.setOpacity(volIdx, overlayOpacity);
+          } else {
+            updateMaskLut(ov, overlayMode, agreementRegion, layerVisibility, overlayOpacity);
+            nv.setOpacity(volIdx, overlayOpacity);
+          }
         }
 
         if (volume.dims && volume.dims.length >= 4) {
@@ -293,20 +450,55 @@ export default function NiiVueViewer({
     };
   }, [baseScanFile, baseScanUrl, activeSequenceKey, activeSequenceLabel, isViewerReady]);
 
-  // Load and Validate Segmentation or Agreement Overlay
+  // Helper to fetch and decompress NIfTI buffer
+  const fetchNiftiBuffer = async (url, label) => {
+    const res = await fetch(url);
+    if (!res.ok) {
+      if (res.status === 404) {
+        throw new Error(`NOT_FOUND: ${label} not available (404)`);
+      }
+      let errDetail = res.statusText;
+      try {
+        const errJson = await res.json();
+        errDetail = errJson.detail || errJson.message || errDetail;
+      } catch (_) {}
+      throw new Error(`Failed to retrieve ${label} (HTTP ${res.status}: ${errDetail})`);
+    }
+
+    const arrayBuf = await res.arrayBuffer();
+    if (arrayBuf.byteLength < 348) {
+      throw new Error(`Retrieved ${label} payload is empty or corrupted.`);
+    }
+
+    let niftiBuffer = arrayBuf;
+    if (nifti.isCompressed(arrayBuf)) {
+      niftiBuffer = nifti.decompress(arrayBuf);
+    }
+    if (!nifti.isNIFTI(niftiBuffer)) {
+      throw new Error(`Retrieved ${label} is not a valid NIfTI medical image.`);
+    }
+
+    const hdr = nifti.readHeader(niftiBuffer);
+    if (!hdr || !hdr.dims) {
+      throw new Error(`NIfTI volume header for ${label} is corrupt: missing dimensions.`);
+    }
+
+    return { niftiBuffer, hdr };
+  };
+
+  // Load and Validate Segmentation, Heatmap, Combined, or Agreement Overlay
   useEffect(() => {
     const nv = nvRef.current;
     if (!nv || !isViewerReady) return;
 
     const isAgreement = overlayMode === 'agreement' && hasExpertMask && caseId;
-    const targetUrl = isAgreement
-      ? getAgreementMaskUrl(caseId, agreementRegion)
-      : (maskUrl || (caseId ? getMaskDownloadUrl(caseId) : null));
+    const isHeatmap = overlayMode === 'heatmap' && caseId;
+    const isCombined = overlayMode === 'combined' && caseId;
 
     const hasCompletedResults = caseResults?.status === 'completed' || caseResults?.regions || activeCase?.volumes || activeCase?.files?.expert_mask?.present || activeCase?.has_mask;
 
-    if (!targetUrl || (!hasCompletedResults && !isAgreement)) {
-      // Clear any leftover overlay volume when switching cases or resetting
+    if (!isAgreement && !isHeatmap && !isCombined && (!maskUrl && (!caseId || !hasCompletedResults))) {
+      // Clear any leftover overlay volumes when switching cases or resetting
       while (nv.volumes && nv.volumes.length > 1) {
         nv.removeVolumeByIndex(1);
       }
@@ -315,98 +507,162 @@ export default function NiiVueViewer({
     }
 
     let isCancelled = false;
-    setStatusMessage(
-      isAgreement
-        ? `Loading Expert Agreement Map (${agreementRegion})...`
-        : 'Loading predicted BraTS 2021 segmentation overlay...'
-    );
+    if (isHeatmap) {
+      setStatusMessage(`Loading predicted probability heat map (${probChannel.toUpperCase()})...`);
+    } else if (isCombined) {
+      setStatusMessage(`Loading combined probability heat map & boundaries (${probChannel.toUpperCase()})...`);
+    } else if (isAgreement) {
+      setStatusMessage(`Loading Expert Agreement Map (${agreementRegion})...`);
+    } else {
+      setStatusMessage('Loading predicted BraTS 2021 segmentation overlay...');
+    }
 
     async function loadMask() {
       try {
-        // Step 1: Pre-fetch and validate HTTP status
-        const res = await fetch(targetUrl);
-        if (!res.ok) {
-          let errDetail = res.statusText;
+        if (isHeatmap) {
+          // Heat Map Mode: Load single continuous probability volume
+          const probUrl = getProbabilityMapUrl(caseId, probChannel);
+          let probData;
           try {
-            const errJson = await res.json();
-            errDetail = errJson.detail || errJson.message || errDetail;
-          } catch (_) {}
-          throw new Error(`Failed to retrieve mask (HTTP ${res.status}: ${errDetail})`);
-        }
-
-        const arrayBuf = await res.arrayBuffer();
-        if (arrayBuf.byteLength < 348) {
-          throw new Error('Retrieved overlay payload is corrupted or empty.');
-        }
-
-        // Step 2: Validate NIfTI header and gzip decompression
-        let niftiBuffer = arrayBuf;
-        if (nifti.isCompressed(arrayBuf)) {
-          niftiBuffer = nifti.decompress(arrayBuf);
-        }
-        if (!nifti.isNIFTI(niftiBuffer)) {
-          throw new Error('Retrieved payload is not a valid NIfTI medical image.');
-        }
-
-        const hdr = nifti.readHeader(niftiBuffer);
-        if (!hdr || !hdr.dims) {
-          throw new Error('NIfTI volume header corrupt: dimensions are missing.');
-        }
-
-        const maskDims = [hdr.dims[1], hdr.dims[2], hdr.dims[3]];
-
-        // Step 3: Verify spatial compatibility with reference MRI volume
-        if (nv.volumes.length > 0 && nv.volumes[0].dims && nv.volumes[0].dims.length >= 4) {
-          const baseDims = [nv.volumes[0].dims[1], nv.volumes[0].dims[2], nv.volumes[0].dims[3]];
-          if (baseDims[0] !== maskDims[0] || baseDims[1] !== maskDims[1] || baseDims[2] !== maskDims[2]) {
-            throw new Error(
-              `Spatial dimension mismatch: Overlay [${maskDims.join('×')}] does not match reference MRI grid [${baseDims.join('×')}]. Overlay withheld from display to prevent clinical misalignment.`
-            );
-          }
-        }
-
-        // Step 4: Verify BraTS label values if prediction mode
-        if (!isAgreement) {
-          const imgData = nifti.readImage(hdr, niftiBuffer);
-          const voxels = new Uint8Array(imgData);
-          const allowedLabels = new Set([0, 1, 2, 4]);
-          const sampleStep = Math.max(1, Math.floor(voxels.length / 50000));
-          for (let i = 0; i < voxels.length; i += sampleStep) {
-            if (!allowedLabels.has(voxels[i])) {
-              console.warn(`Encountered non-standard label ${voxels[i]} in predicted mask.`);
-              break;
+            probData = await fetchNiftiBuffer(probUrl, `probability map (${probChannel})`);
+          } catch (fetchErr) {
+            if (fetchErr.message.includes('NOT_FOUND')) {
+              setStatusMessage('Model probability maps are unavailable for this study. Retaining standard BraTS segmentation overlay.');
+              setOverlayMode('prediction');
+              return;
             }
+            throw fetchErr;
           }
+
+          if (isCancelled) return;
+
+          const probVolume = await NVImage.loadFromUrl({
+            url: probData.niftiBuffer,
+            name: `prob_${probChannel}.nii`,
+            opacity: overlayOpacity,
+          });
+
+          if (isCancelled) return;
+
+          updateMaskLut(probVolume, 'heatmap', null, null, overlayOpacity);
+
+          while (nv.volumes && nv.volumes.length > 1) {
+            nv.removeVolumeByIndex(1);
+          }
+          nv.addVolume(probVolume);
+          nv.setOpacity(1, overlayOpacity);
+          nv.updateGLVolume();
+
+          setStatusMessage(
+            `Heat Map Active • Continuous Probability (${probChannel.toUpperCase()} [0.0 - 1.0]) • Blue (Low) -> Cyan -> Green/Yellow -> Red (High)`
+          );
+        } else if (isCombined) {
+          // Combined Mode: Multi-overlay with Probability Heat Map (Vol 1) + Discrete Boundaries (Vol 2)
+          const probUrl = getProbabilityMapUrl(caseId, probChannel);
+          const boundUrl = getBoundaryMaskUrl(caseId);
+
+          let probData;
+          try {
+            probData = await fetchNiftiBuffer(probUrl, `probability map (${probChannel})`);
+          } catch (fetchErr) {
+            if (fetchErr.message.includes('NOT_FOUND')) {
+              setStatusMessage('Model probability maps are unavailable for this study. Retaining standard BraTS segmentation overlay.');
+              setOverlayMode('prediction');
+              return;
+            }
+            throw fetchErr;
+          }
+
+          if (isCancelled) return;
+
+          let boundData = null;
+          try {
+            boundData = await fetchNiftiBuffer(boundUrl, 'boundary mask');
+          } catch (boundErr) {
+            console.warn('Boundary mask could not be loaded:', boundErr.message);
+          }
+
+          if (isCancelled) return;
+
+          const probVolume = await NVImage.loadFromUrl({
+            url: probData.niftiBuffer,
+            name: `prob_${probChannel}.nii`,
+            opacity: overlayOpacity,
+          });
+
+          let boundVolume = null;
+          if (boundData) {
+            boundVolume = await NVImage.loadFromUrl({
+              url: boundData.niftiBuffer,
+              name: 'boundary_seg.nii',
+              opacity: 1.0,
+            });
+          }
+
+          if (isCancelled) return;
+
+          updateMaskLut(probVolume, 'heatmap', null, null, overlayOpacity);
+          if (boundVolume) {
+            updateMaskLut(boundVolume, 'boundary', null, layerVisibility, 1.0);
+          }
+
+          while (nv.volumes && nv.volumes.length > 1) {
+            nv.removeVolumeByIndex(1);
+          }
+          nv.addVolume(probVolume);
+          nv.setOpacity(1, overlayOpacity);
+
+          if (boundVolume) {
+            nv.addVolume(boundVolume);
+            nv.setOpacity(2, 1.0);
+          }
+
+          nv.updateGLVolume();
+
+          setStatusMessage(
+            `Combined Active • Continuous Heat Map (${probChannel.toUpperCase()}) + Delineated Segmentation Boundaries`
+          );
+        } else {
+          // Discrete Segmentation or Expert Agreement Mode
+          const targetUrl = isAgreement
+            ? getAgreementMaskUrl(caseId, agreementRegion)
+            : (maskUrl || (caseId ? getMaskDownloadUrl(caseId) : null));
+
+          if (!targetUrl) return;
+
+          const maskData = await fetchNiftiBuffer(
+            targetUrl,
+            isAgreement ? `agreement (${agreementRegion})` : 'predicted segmentation'
+          );
+
+          if (isCancelled) return;
+
+          const maskVolume = await NVImage.loadFromUrl({
+            url: maskData.niftiBuffer,
+            name: isAgreement ? `agreement_${agreementRegion}.nii` : 'predicted_seg.nii',
+            opacity: overlayOpacity,
+          });
+
+          if (isCancelled) return;
+
+          updateMaskLut(maskVolume, overlayMode, agreementRegion, layerVisibility, overlayOpacity);
+
+          while (nv.volumes && nv.volumes.length > 1) {
+            nv.removeVolumeByIndex(1);
+          }
+          nv.addVolume(maskVolume);
+          nv.setOpacity(1, overlayOpacity);
+          nv.updateGLVolume();
+
+          setStatusMessage(
+            isAgreement
+              ? `Expert Agreement Active (${agreementRegion}) • 🟢 TP Consensus | 🔴 FP Over-pred | 🟣 FN Missed`
+              : 'Segmentation overlay active • 🟡 ET (Enhancing) | 🔵 TC (Core) | 🟢 WT (Edema)'
+          );
         }
-
-        // Step 5: Load validated volume into NiiVue with uncompressed payload
-        const maskVolume = await NVImage.loadFromUrl({
-          url: niftiBuffer,
-          name: isAgreement ? `agreement_${agreementRegion}.nii` : 'predicted_seg.nii',
-          opacity: overlayOpacity,
-        });
-
-        if (isCancelled) return;
-
-        // Apply custom discrete label colormap
-        updateMaskLut(maskVolume, overlayMode, agreementRegion, layerVisibility, overlayOpacity);
-
-        // Replace any existing overlay
-        while (nv.volumes && nv.volumes.length > 1) {
-          nv.removeVolumeByIndex(1);
-        }
-        nv.addVolume(maskVolume);
-        nv.setOpacity(1, overlayOpacity);
-        nv.updateGLVolume();
-
-        setStatusMessage(
-          isAgreement
-            ? `Expert Agreement Active (${agreementRegion}) • 🟢 TP Consensus | 🔴 FP Over-pred | 🟣 FN Missed`
-            : 'Segmentation overlay active • 🟡 ET (Enhancing) | 🔵 TC (Core) | 🟢 WT (Edema)'
-        );
       } catch (err) {
         if (!isCancelled) {
-          console.error('Mask overlay loading error:', err.message);
+          console.error('Overlay loading error:', err.message);
           setStatusMessage(`Overlay notice: ${err.message}`);
         }
       }
@@ -417,17 +673,31 @@ export default function NiiVueViewer({
     return () => {
       isCancelled = true;
     };
-  }, [maskUrl, overlayMode, agreementRegion, caseId, hasExpertMask, isViewerReady, baseLoadedCount, caseResults, activeCase]);
+  }, [maskUrl, overlayMode, agreementRegion, probChannel, caseId, hasExpertMask, isViewerReady, baseLoadedCount, caseResults, activeCase]);
 
   // Synchronize colormap LUT whenever tissue visibility toggles or opacity changes
   useEffect(() => {
     const nv = nvRef.current;
     if (!nv || !isViewerReady || !nv.volumes || nv.volumes.length < 2) return;
-    const maskVol = nv.volumes[1];
-    updateMaskLut(maskVol, overlayMode, agreementRegion, layerVisibility, overlayOpacity);
-    nv.setOpacity(1, overlayOpacity);
+
+    if (overlayMode === 'combined') {
+      const heatVol = nv.volumes[1];
+      if (heatVol) {
+        updateMaskLut(heatVol, 'heatmap', null, null, overlayOpacity);
+        nv.setOpacity(1, overlayOpacity);
+      }
+      if (nv.volumes.length >= 3) {
+        const boundVol = nv.volumes[2];
+        updateMaskLut(boundVol, 'boundary', null, layerVisibility, 1.0);
+        nv.setOpacity(2, 1.0);
+      }
+    } else {
+      const maskVol = nv.volumes[1];
+      updateMaskLut(maskVol, overlayMode, agreementRegion, layerVisibility, overlayOpacity);
+      nv.setOpacity(1, overlayOpacity);
+    }
     nv.updateGLVolume();
-  }, [layerVisibility, overlayOpacity, overlayMode, agreementRegion, isViewerReady]);
+  }, [layerVisibility, overlayOpacity, overlayMode, agreementRegion, probChannel, isViewerReady]);
 
   // Handle Suggested Tumor Crosshair Positioning
   useEffect(() => {
@@ -577,14 +847,31 @@ export default function NiiVueViewer({
           </button>
         </div>
 
-        {/* Overlay Mode Switcher */}
-        <div className="segmented-control">
+        {/* Visualization Mode Switcher */}
+        <div className="segmented-control mobile-scrollable-segmented">
           <button
             type="button"
             className={`segmented-btn ${overlayMode === 'prediction' ? 'active' : ''}`}
             onClick={() => setOverlayMode('prediction')}
+            title="Discrete BraTS segmentation labels (WT, TC, ET)"
           >
-            BraTS Labels
+            Segmentation
+          </button>
+          <button
+            type="button"
+            className={`segmented-btn ${overlayMode === 'heatmap' ? 'active' : ''}`}
+            onClick={() => setOverlayMode('heatmap')}
+            title="Continuous voxel-wise probability heat map from SegResNet sigmoid outputs"
+          >
+            Heat Map
+          </button>
+          <button
+            type="button"
+            className={`segmented-btn ${overlayMode === 'combined' ? 'active' : ''}`}
+            onClick={() => setOverlayMode('combined')}
+            title="Combined: continuous probability heat map with discrete segmentation boundaries"
+          >
+            Combined
           </button>
           <button
             type="button"
@@ -598,7 +885,7 @@ export default function NiiVueViewer({
           </button>
         </div>
 
-        {/* Center Toolset: Mask Opacity & Color Chips / Agreement Legend */}
+        {/* Center Toolset: Mask Opacity & Color Chips / Agreement Legend / Heat Map Legend */}
         <div style={{ display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap' }}>
           {/* Opacity Scrubber */}
           <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
@@ -618,7 +905,169 @@ export default function NiiVueViewer({
 
           <div style={{ height: '18px', width: '1px', backgroundColor: 'var(--border-subtle)' }} />
 
-          {overlayMode === 'agreement' ? (
+          {overlayMode === 'heatmap' ? (
+            /* Continuous Probability Controls & Legend */
+            <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
+              {/* Channel Selector */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                <span style={{ fontSize: '10px', fontWeight: 600, color: '#475569' }}>Prob:</span>
+                {[
+                  { id: 'max', label: 'Max' },
+                  { id: 'wt', label: 'WT' },
+                  { id: 'tc', label: 'TC' },
+                  { id: 'et', label: 'ET' },
+                ].map((ch) => (
+                  <button
+                    key={ch.id}
+                    type="button"
+                    onClick={() => setProbChannel(ch.id)}
+                    style={{
+                      padding: '2px 7px',
+                      fontSize: '10px',
+                      fontWeight: probChannel === ch.id ? 700 : 500,
+                      backgroundColor: probChannel === ch.id ? 'var(--primary-accent)' : '#FFFFFF',
+                      color: probChannel === ch.id ? '#FFFFFF' : '#334155',
+                      border: '1px solid #CBD5E1',
+                      borderRadius: '3px',
+                      cursor: 'pointer',
+                    }}
+                    title={`Predicted voxel-wise sigmoid activation: ${ch.label}`}
+                  >
+                    {ch.label}
+                  </button>
+                ))}
+              </div>
+
+              {/* Continuous Probability Legend Bar 0.0 to 1.0 */}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '2px', minWidth: '150px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '9px', fontWeight: 600, color: '#334155' }}>
+                  <span>Tumour Probability</span>
+                  <span style={{ fontFamily: 'monospace', color: '#64748B' }}>0.0 — 1.0</span>
+                </div>
+                <div
+                  style={{
+                    height: '8px',
+                    width: '100%',
+                    borderRadius: '2px',
+                    background: 'linear-gradient(to right, rgb(0, 20, 150) 0%, rgb(0, 210, 255) 25%, rgb(0, 230, 30) 50%, rgb(255, 215, 0) 75%, rgb(255, 20, 20) 100%)',
+                    border: '1px solid rgba(0,0,0,0.15)',
+                    boxShadow: 'inset 0 1px 2px rgba(0,0,0,0.15)',
+                  }}
+                />
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '8px', color: '#64748B' }}>
+                  <span>0.0 (Low)</span>
+                  <span>0.5</span>
+                  <span>1.0 (High)</span>
+                </div>
+              </div>
+            </div>
+          ) : overlayMode === 'combined' ? (
+            /* Combined Mode: Continuous Heat Map + Discrete Boundary Toggles */
+            <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
+              {/* Channel Selector */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                <span style={{ fontSize: '10px', fontWeight: 600, color: '#475569' }}>Prob:</span>
+                {[
+                  { id: 'max', label: 'Max' },
+                  { id: 'wt', label: 'WT' },
+                  { id: 'tc', label: 'TC' },
+                  { id: 'et', label: 'ET' },
+                ].map((ch) => (
+                  <button
+                    key={ch.id}
+                    type="button"
+                    onClick={() => setProbChannel(ch.id)}
+                    style={{
+                      padding: '2px 7px',
+                      fontSize: '10px',
+                      fontWeight: probChannel === ch.id ? 700 : 500,
+                      backgroundColor: probChannel === ch.id ? 'var(--primary-accent)' : '#FFFFFF',
+                      color: probChannel === ch.id ? '#FFFFFF' : '#334155',
+                      border: '1px solid #CBD5E1',
+                      borderRadius: '3px',
+                      cursor: 'pointer',
+                    }}
+                    title={`Continuous probability channel: ${ch.label}`}
+                  >
+                    {ch.label}
+                  </button>
+                ))}
+              </div>
+
+              {/* Boundary Contour Toggles */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                <span style={{ fontSize: '10px', fontWeight: 600, color: '#475569' }}>Contours:</span>
+                <button
+                  type="button"
+                  className="roi-chip-btn"
+                  style={{
+                    backgroundColor: 'var(--tissue-wt)',
+                    color: '#FFFFFF',
+                    borderColor: 'var(--tissue-wt-border)',
+                    opacity: layerVisibility.WT ? 1 : 0.4,
+                    padding: '2px 6px',
+                    fontSize: '10px'
+                  }}
+                  onClick={() => toggleLayer('WT')}
+                  title="Toggle WT boundary contour"
+                >
+                  <Check size={10} strokeWidth={3} />
+                  <span>WT</span>
+                </button>
+                <button
+                  type="button"
+                  className="roi-chip-btn"
+                  style={{
+                    backgroundColor: 'var(--tissue-tc)',
+                    color: '#FFFFFF',
+                    borderColor: 'var(--tissue-tc-border)',
+                    opacity: layerVisibility.TC ? 1 : 0.4,
+                    padding: '2px 6px',
+                    fontSize: '10px'
+                  }}
+                  onClick={() => toggleLayer('TC')}
+                  title="Toggle TC boundary contour"
+                >
+                  <Check size={10} strokeWidth={3} />
+                  <span>TC</span>
+                </button>
+                <button
+                  type="button"
+                  className="roi-chip-btn"
+                  style={{
+                    backgroundColor: 'var(--tissue-et)',
+                    color: '#0F172A',
+                    borderColor: 'var(--tissue-et-border)',
+                    opacity: layerVisibility.ET ? 1 : 0.4,
+                    padding: '2px 6px',
+                    fontSize: '10px'
+                  }}
+                  onClick={() => toggleLayer('ET')}
+                  title="Toggle ET boundary contour"
+                >
+                  <Check size={10} strokeWidth={3} />
+                  <span>ET</span>
+                </button>
+              </div>
+
+              {/* Mini Continuous Probability Legend */}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '2px', minWidth: '120px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '9px', fontWeight: 600, color: '#334155' }}>
+                  <span>Probability</span>
+                  <span style={{ fontFamily: 'monospace', color: '#64748B' }}>0.0 — 1.0</span>
+                </div>
+                <div
+                  style={{
+                    height: '7px',
+                    width: '100%',
+                    borderRadius: '2px',
+                    background: 'linear-gradient(to right, rgb(0, 20, 150) 0%, rgb(0, 210, 255) 25%, rgb(0, 230, 30) 50%, rgb(255, 215, 0) 75%, rgb(255, 20, 20) 100%)',
+                    border: '1px solid rgba(0,0,0,0.15)',
+                  }}
+                />
+              </div>
+            </div>
+          ) : overlayMode === 'agreement' ? (
             <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
               <span style={{ fontSize: '10px', fontWeight: 600, color: '#475569' }}>Region:</span>
               {['WT', 'TC', 'ET'].map((reg) => (
@@ -738,12 +1187,12 @@ export default function NiiVueViewer({
             <span>Centroid</span>
           </button>
 
-          {/* Reset Camera / Orientation Action */}
+          {/* Reset Camera / Multiplanar / Orientation Action */}
           <button
             type="button"
             className="segmented-btn"
-            title="Reset 2D crosshair and 3D camera to default canonical orientation"
-            onClick={handleResetCamera}
+            title="Reset 2D multiplanar crosshair, 3D camera, window/level, and opacity to default"
+            onClick={handleResetView}
             style={{
               display: 'flex',
               alignItems: 'center',
@@ -805,9 +1254,9 @@ export default function NiiVueViewer({
           </div>
 
           {/* Live Coordinate Pill Badge */}
-          <div className="coordinate-pill-badge">
-            {crosshairPos?.vox
-              ? `Voxel: [${crosshairPos.vox.join(', ')}] | World: [${(crosshairPos.mm || []).map((m) => (m !== null && !isNaN(m) ? `${m}mm` : '0.0mm')).join(', ')}]`
+          <div className="coordinate-pill-badge" id="workstation-coordinates-badge">
+            {crosshairPos?.vox && crosshairPos?.mm
+              ? `Voxel: [${crosshairPos.vox.join(', ')}] | World: [${crosshairPos.mm.map((m) => `${m.toFixed(1)}mm`).join(', ')}]`
               : 'Voxel: [--, --, --] | World: [--, --, --]'}
           </div>
         </div>

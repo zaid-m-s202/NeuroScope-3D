@@ -76,7 +76,7 @@ class NumberedCanvas(canvas.Canvas):
 
         # Running Top Header (pages 2 and higher)
         if self._pageNumber > 1:
-            self.drawString(36, 758, "NeuroScope 3D — Brain MRI Segmentation Research Report (Research & Teaching Only • Non-Diagnostic)")
+            self.drawString(36, 758, "NeuroScope 3D — Research Evaluation Report • Technical Audit Record (Research & Teaching Only • Non-Diagnostic)")
             self.setStrokeColor(colors.HexColor('#E2E8F0'))
             self.setLineWidth(0.5)
             self.line(36, 752, 576, 752)
@@ -341,13 +341,13 @@ def generate_pdf_report(
         parent=styles['Normal'],
         fontName='Helvetica',
         fontSize=7.8,
-        leading=11,
+        leading=10.5,
         textColor=colors.HexColor('#1E293B'),
         backColor=colors.HexColor('#F8FAFC'),
         borderColor=colors.HexColor('#CBD5E1'),
         borderWidth=0.5,
-        borderPadding=6,
-        spaceAfter=6,
+        borderPadding=4,
+        spaceAfter=3,
     )
 
     story = []
@@ -395,7 +395,7 @@ def generate_pdf_report(
 
     # A. Header & Branding
     story.append(Paragraph("NeuroScope 3D", title_style))
-    story.append(Paragraph("Brain MRI Segmentation Research Report • Multi-Parametric AI Inference", subtitle_style))
+    story.append(Paragraph("Research Evaluation Report • Technical Audit Record • Multi-Parametric AI Inference", subtitle_style))
     story.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor('#086288'), spaceAfter=8))
 
     # B. Mandatory Safety Notice
@@ -920,14 +920,45 @@ def generate_pdf_report(
         story.append(case_acc_table)
         story.append(Spacer(1, 4))
 
+        m_wt = metrics.get("WT", {})
+        m_tc = metrics.get("TC", {})
+        m_et = metrics.get("ET", {})
+
+        wt_dsc = m_wt.get("dice")
+        wt_dsc_str = f"{wt_dsc:.4f}" if wt_dsc is not None else "N/A"
+        wt_sens = m_wt.get("sensitivity")
+        wt_sens_str = f"{wt_sens:.4f}" if wt_sens is not None else "N/A"
+        wt_hd95 = m_wt.get("hd95_mm")
+        wt_hd95_str = f"{wt_hd95:.2f} mm" if wt_hd95 is not None else "N/A"
+
+        tc_dsc = m_tc.get("dice")
+        tc_dsc_str = f"{tc_dsc:.4f}" if tc_dsc is not None else "N/A"
+        tc_sens = m_tc.get("sensitivity")
+        tc_sens_str = f"{tc_sens:.4f}" if tc_sens is not None else "N/A"
+        tc_hd95 = m_tc.get("hd95_mm")
+        tc_hd95_str = f"{tc_hd95:.2f} mm" if tc_hd95 is not None else "N/A"
+
+        et_dsc = m_et.get("dice")
+        et_dsc_str = f"{et_dsc:.4f}" if et_dsc is not None else "N/A"
+        et_sens = m_et.get("sensitivity")
+        et_sens_str = f"{et_sens:.4f}" if et_sens is not None else "N/A"
+        et_rel = m_et.get("relative_diff_percent")
+        et_rel_str = f"{et_rel:+.1f}%" if et_rel is not None else "N/A"
+        et_diff = m_et.get("signed_diff_ml")
+        et_diff_str = f"{et_diff:+.2f} mL" if et_diff is not None else "N/A"
+        et_hd95 = m_et.get("hd95_mm")
+        et_hd95_str = f"{et_hd95:.2f} mm" if et_hd95 is not None else "N/A"
+
         et_callout_text = (
             "<b>Objective Case Agreement Analysis:</b> Agreement metrics quantify spatial contour overlap and volume concordance "
-            "between the automated SegResNet prediction and the expert reference mask; they do not measure biological truth or clinical diagnosis.<br/>"
-            "• <b>Whole Tumour (WT) & Tumour Core (TC):</b> High volumetric and boundary agreement is observed (WT Dice 0.9328, Sens 0.9419, "
-            "HD95 2.45 mm; TC Dice 0.9392, Sens 0.9234, HD95 2.45 mm).<br/>"
+            "between the automated SegResNet prediction and the expert reference mask for this single labelled evaluation case; "
+            "they do not measure biological truth or clinical diagnosis, and do not prove generalisation or clinical readiness across wider cohorts.<br/>"
+            f"• <b>Whole Tumour (WT) & Tumour Core (TC):</b> High volumetric and boundary agreement is observed on this case "
+            f"(WT Dice {wt_dsc_str}, Sens {wt_sens_str}, HD95 {wt_hd95_str}; "
+            f"TC Dice {tc_dsc_str}, Sens {tc_sens_str}, HD95 {tc_hd95_str}).<br/>"
             "• <b>Enhancing Tumour (ET) Subregion Analysis:</b> While WT and TC exhibit strong agreement, the enhancing tumour (ET) subregion "
-            "demonstrates lower overlap (Dice 0.8722, Sensitivity 0.8236, Relative Volume Difference -11.2%, HD95 2.24 mm). This reflects "
-            "predicted under-segmentation (-0.72 mL) along fine, irregular peripheral margins where contrast enhancement is subtle. "
+            f"demonstrates lower overlap (Dice {et_dsc_str}, Sensitivity {et_sens_str}, Relative Volume Difference {et_rel_str}, HD95 {et_hd95_str}). "
+            f"This reflects predicted under-segmentation ({et_diff_str}) along fine, irregular peripheral margins where contrast enhancement is subtle. "
             "Agreement metrics on nested subregions should be evaluated independently and not obscured by composite whole-tumour scores."
         )
         story.append(Paragraph(et_callout_text, callout_style))
@@ -952,9 +983,11 @@ def generate_pdf_report(
         "are: <b>Whole Tumour (WT)</b> mean Dice <b>0.9026</b> (± 0.038, sens 0.9250, HD95 4.25 mm), "
         "<b>Tumour Core (TC)</b> mean Dice <b>0.8559</b> (± 0.062, sens 0.8710, HD95 5.80 mm), and "
         "<b>Enhancing Tumour (ET)</b> mean Dice <b>0.7905</b> (± 0.089, sens 0.8120, HD95 3.90 mm).<br/>"
-        "<b>Training Data Overlap Disclosure:</b> Historical scans re-indexed into subsequent BraTS releases "
-        "may exhibit overlap with original 2018 training partitions. <i>Cohort-level metrics describe historical "
-        "population benchmarks and do not guarantee segmentation accuracy on any individual patient scan. "
+        "<b>Single Case Evaluation Notice & Training Data Overlap Disclosure:</b> All case-specific metrics in this report "
+        "represent experimental results from evaluating one labelled case (BraTS2021_00495) and must not be interpreted as evidence "
+        "of generalisation, algorithmic safety, or clinical readiness across unseen clinical populations. "
+        "Historical scans re-indexed into subsequent BraTS releases may exhibit overlap with original 2018 training partitions. "
+        "<i>Cohort-level metrics describe historical population benchmarks and do not guarantee segmentation accuracy on any individual patient scan. "
         "All case-specific metrics in this report represent real evaluations on the uploaded study.</i>",
         callout_style
     ))
@@ -969,10 +1002,8 @@ def generate_pdf_report(
         "<b>Preprocessing Dependencies:</b> Segmentation fidelity depends on accurate skull-stripping and 1.0 mm isotropic spatial co-registration across all four sequences.",
         "<b>Non-Diagnostic:</b> Contours and volumetric measurements are research estimates and must never be utilized for diagnosis, radiation planning, or surgical navigation.",
     ]
-    for lim in limitations_text:
-        story.append(Paragraph(f"• {lim}", body_style))
-        story.append(Spacer(1, 2))
-    story.append(Spacer(1, 5))
+    story.append(Paragraph("<br/>".join([f"• {lim}" for lim in limitations_text]), body_style))
+    story.append(Spacer(1, 3))
 
     # C. Input Quality Verification & Checks
     story.append(Paragraph("Study Geometry & Input Quality Audit", subheading_style))
@@ -1055,8 +1086,8 @@ def generate_pdf_report(
         ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#E2E8F0')),
         ('BOX', (0, 0), (-1, -1), 0.5, colors.HexColor('#CBD5E1')),
         ('INNERGRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#CBD5E1')),
-        ('TOPPADDING', (0, 0), (-1, -1), 2.5),
-        ('BOTTOMPADDING', (0, 0), (-1, -1), 2.5),
+        ('TOPPADDING', (0, 0), (-1, -1), 1.5),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 1.5),
     ]))
     story.append(val_table)
 

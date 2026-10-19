@@ -1,0 +1,191 @@
+{
+  "report_title": "NeuroScope 3D - Real-Data Model Validation Report",
+  "generation_timestamp": "2026-10-18T21:05:00+05:30",
+  "disclaimer": "Research and teaching prototype only. Not for clinical diagnosis, patient care, or surgical planning.",
+  "objective": "Independent reproducible evaluation of pretrained MONAI SegResNet on real labelled MRI cases.",
+  "model_information": {
+    "model_name": "MONAI SegResNet (BraTS MRI Segmentation)",
+    "architecture": "SegResNet",
+    "architecture_parameters": {
+      "init_filters": 16,
+      "in_channels": 4,
+      "out_channels": 3,
+      "blocks_down": [1, 2, 2, 4],
+      "blocks_up": [1, 1, 1],
+      "dropout_prob": 0.2
+    },
+    "checkpoint_path": "models/brats_mri_segmentation/models/model.pt",
+    "checkpoint_sha256": "860ccb3f1c21c99d0410ad8a1ac4ef6b8fab60cec0a503b0ba42675741a750ae",
+    "torchscript_path": "models/brats_mri_segmentation/models/model.ts",
+    "torchscript_sha256": "729980a0bd9347bf2397701eb329e12517918dc282a2d09c40458e95b24ceed9",
+    "training_data_source": "BraTS 2018 Training Cohort (285 cases)",
+    "training_overlap_disclosure": "Pretrained MONAI SegResNet bundle was trained on the historical BraTS 2018 Training cohort. When evaluating on BraTS 2021 cases, some patient scans from the historical BraTS 2018 set may have been re-indexed into subsequent challenge releases. Complete independence cannot be proven without raw clinical accession logs.",
+    "preprocessing_pipeline": {
+      "channel_order": ["0: T1ce/T1Gd", "1: T1", "2: T2", "3: FLAIR"],
+      "intensity_normalization": "NormalizeIntensityd(nonzero=True, channel_wise=True)",
+      "inference_roi_size": [240, 240, 160],
+      "inference_overlap": 0.5,
+      "inferer": "SlidingWindowInferer(mode='gaussian')"
+    },
+    "postprocessing_pipeline": {
+      "activation": "Sigmoid",
+      "threshold": 0.5,
+      "hierarchical_nesting_enforcement": "ET <= TC <= WT (torch.where(ET > 0, 4, torch.where(TC > 0, 1, torch.where(WT > 0, 2, 0))))",
+      "output_label_definitions": {
+        "0": "Background",
+        "1": "Necrotic & non-enhancing tumor core (NCR/NET)",
+        "2": "Peritumoral edema (ED)",
+        "4": "GD-enhancing tumor (ET)"
+      }
+    }
+  },
+  "data_audit": {
+    "total_real_labelled_cases_available_locally": 1,
+    "target_cohort_size_required": 10,
+    "status": "DATASET_STORAGE_LIMITATION_ENCOUNTERED",
+    "limitation_statement": "In accordance with Step 1.5 and Step 4 instructions, multi-case evaluation is stopped at the exact count of available real labelled cases (1 case: BraTS2021_00495). No synthetic cases were substituted, and no precomputed benchmark metrics were recycled as fresh measurements.",
+    "dataset_directory_requirement": "To evaluate a full 10-case cohort, mount or place 10 multi-sequence BraTS directories containing T1, T1ce, T2, FLAIR, and Seg NIfTI files into data/cohort/ and execute evaluation/batch_evaluator.py --cases-dir data/cohort/.",
+    "cases_evaluated": [
+      {
+        "case_id": "BraTS2021_00495",
+        "patient_id": "BraTS2021_00495",
+        "source": "BraTS 2021 Development/Validation Cohort (UPenn SBIA)",
+        "status": "evaluated_fresh",
+        "inference_duration_seconds": 34.79,
+        "inference_device": "cpu",
+        "spatial_geometry": {
+          "dimensions": [240, 240, 155],
+          "voxel_spacing_mm": [1.0, 1.0, 1.0],
+          "orientation": "LPS",
+          "affine_aligned": true
+        },
+        "output_verification": {
+          "output_file": "outputs/real_cohort_eval/BraTS2021_00495_pred.nii.gz",
+          "output_shape": [240, 240, 155],
+          "unique_labels": [0, 1, 2, 4],
+          "alignment_status": "verified_aligned"
+        },
+        "metrics": {
+          "WT": {
+            "dice": 0.9513,
+            "sensitivity": 0.9305,
+            "precision": 0.973,
+            "specificity": 0.9997,
+            "hd95_mm": 2.0,
+            "predicted_voxels": 94963,
+            "reference_voxels": 99302,
+            "predicted_volume_ml": 94.963,
+            "reference_volume_ml": 99.302,
+            "signed_diff_ml": -4.339,
+            "absolute_diff_ml": 4.339,
+            "relative_diff_percent": -4.37,
+            "confusion_matrix": {
+              "tp_voxels": 92403,
+              "fp_voxels": 2560,
+              "fn_voxels": 6899,
+              "tn_voxels": 8826138
+            },
+            "centroid_voxel": [98, 164, 98],
+            "centroid_world_mm": [-98.27, 74.59, 98.14]
+          },
+          "TC": {
+            "dice": 0.9584,
+            "sensitivity": 0.9522,
+            "precision": 0.9646,
+            "specificity": 0.9998,
+            "hd95_mm": 2.45,
+            "predicted_voxels": 52175,
+            "reference_voxels": 52855,
+            "predicted_volume_ml": 52.175,
+            "reference_volume_ml": 52.855,
+            "signed_diff_ml": -0.68,
+            "absolute_diff_ml": 0.68,
+            "relative_diff_percent": -1.29,
+            "confusion_matrix": {
+              "tp_voxels": 50328,
+              "fp_voxels": 1847,
+              "fn_voxels": 2527,
+              "tn_voxels": 8873298
+            },
+            "centroid_voxel": [97, 176, 93],
+            "centroid_world_mm": [-97.49, 63.4, 92.82]
+          },
+          "ET": {
+            "dice": 0.8722,
+            "sensitivity": 0.8236,
+            "precision": 0.9269,
+            "specificity": 0.9998,
+            "hd95_mm": 1.41,
+            "predicted_voxels": 28475,
+            "reference_voxels": 32047,
+            "predicted_volume_ml": 28.475,
+            "reference_volume_ml": 32.047,
+            "signed_diff_ml": -3.572,
+            "absolute_diff_ml": 3.572,
+            "relative_diff_percent": -11.15,
+            "confusion_matrix": {
+              "tp_voxels": 26394,
+              "fp_voxels": 2081,
+              "fn_voxels": 5653,
+              "tn_voxels": 8893872
+            },
+            "centroid_voxel": [98, 176, 92],
+            "centroid_world_mm": [-97.72, 63.49, 91.9]
+          }
+        },
+        "independent_validation": {
+          "status": "verified_concordant",
+          "identities_verified": [
+            "TP + FP == N_pred",
+            "TP + FN == N_ref",
+            "TP + FP + FN + TN == total_voxels",
+            "WT_volume >= TC_volume >= ET_volume"
+          ]
+        }
+      }
+    ]
+  },
+  "cohort_summary": {
+    "freshly_evaluated_real_cases_count": 1,
+    "mean_metrics": {
+      "WT": {
+        "dice": 0.9513,
+        "sensitivity": 0.9305,
+        "precision": 0.973,
+        "specificity": 0.9997,
+        "hd95_mm": 2.0
+      },
+      "TC": {
+        "dice": 0.9584,
+        "sensitivity": 0.9522,
+        "precision": 0.9646,
+        "specificity": 0.9998,
+        "hd95_mm": 2.45
+      },
+      "ET": {
+        "dice": 0.8722,
+        "sensitivity": 0.8236,
+        "precision": 0.9269,
+        "specificity": 0.9998,
+        "hd95_mm": 1.41
+      }
+    },
+    "failures_count": 0,
+    "missing_cases_to_reach_target": 9
+  },
+  "separation_of_data_modalities": {
+    "live_measured_real_data": {
+      "cases": ["BraTS2021_00495"],
+      "description": "Actual freshly computed PyTorch SegResNet inference on real patient scan with verified ground truth."
+    },
+    "synthetic_demonstration_data": {
+      "cases": ["sample_study (BraTS2021_00000)"],
+      "description": "Artificial 64x64x48 geometric ellipsoid used for UI scaffolding and failure pack testing; excluded from real patient statistics."
+    },
+    "precomputed_reference_benchmark": {
+      "source_file": "data/cohort_benchmark.json",
+      "cases_count": 10,
+      "description": "Historical population reference benchmark describing 10 BraTS 2021 cases; kept separate from live measured inference."
+    }
+  }
+}

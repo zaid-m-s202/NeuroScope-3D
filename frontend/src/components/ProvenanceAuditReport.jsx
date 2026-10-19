@@ -84,19 +84,19 @@ export default function ProvenanceAuditReport({
 
   return (
     <div className="audit-report-container">
-      {/* Institutional Validation Log Header Card */}
+      {/* Technical Audit Record Header Card */}
       <div className="audit-card">
         <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '8px' }}>
             <div>
               <div className="sidebar-section-title" style={{ color: 'var(--primary-accent)', margin: 0 }}>
-                Institutional Validation Log
+                Technical Audit Record
               </div>
               <h1 style={{ fontSize: '20px', fontWeight: 700, color: 'var(--on-surface-dark)', marginTop: '2px' }}>
                 NeuroScope 3D — Advanced Neuro-Imaging Research Platform
               </h1>
               <div style={{ fontSize: '12px', color: 'var(--on-surface-variant)', marginTop: '2px' }}>
-                Certified Segmentation Audit Record · Case ID: <strong style={{ color: 'var(--on-surface-dark)' }}>{resolvedCaseId}</strong>
+                Technical Audit Record · Case ID: <strong style={{ color: 'var(--on-surface-dark)' }}>{resolvedCaseId}</strong>
               </div>
             </div>
 
@@ -436,7 +436,7 @@ export default function ProvenanceAuditReport({
               style={{ width: 'auto', padding: '0 16px', textDecoration: 'none' }}
             >
               <FileText size={14} />
-              <span>Download Certified PDF Report</span>
+              <span>Download Technical Audit Report (PDF)</span>
             </a>
           </div>
         ) : (

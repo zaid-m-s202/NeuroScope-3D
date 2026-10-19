@@ -22,7 +22,11 @@ export default function UploadAnalysisView({
   activeCase,
   caseResults,
   onOpenWorkstation,
-  onOpenAnalytics
+  onOpenAnalytics,
+  ingestionFiles,
+  onIngestionFilesChange,
+  uploadResult,
+  onUploadResultChange,
 }) {
   const effectiveCaseId = caseResults?.case_id || activeCase?.case_id;
   const isSegmented = caseResults?.status === 'completed';
@@ -132,6 +136,11 @@ export default function UploadAnalysisView({
             onSegmentationCompleted={onSegmentationCompleted}
             onBaseScanSelected={onBaseScanSelected}
             onValidationError={onValidationError}
+            files={ingestionFiles}
+            onFilesChange={onIngestionFilesChange}
+            uploadResult={uploadResult}
+            onUploadResultChange={onUploadResultChange}
+            activeCase={activeCase}
           />
         </div>
 

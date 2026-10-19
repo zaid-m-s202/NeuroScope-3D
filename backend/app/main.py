@@ -1,4 +1,22 @@
 import os
+import sys
+from pathlib import Path
+
+# Ensure repository root is on sys.path so modules (backend, inference, evaluation) can be imported
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+# NumPy 1.x / SciPy compatibility shim for scipy.sparse scalar lookups
+try:
+    import numpy as _np
+    if not hasattr(_np, "long"):
+        _np.long = int
+    if not hasattr(_np, "ulong"):
+        _np.ulong = int
+except Exception:
+    pass
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from backend.app.api.routes import router as api_router

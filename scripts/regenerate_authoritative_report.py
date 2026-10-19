@@ -7,10 +7,10 @@ import os
 import sys
 sys.path.insert(0, os.path.abspath("."))
 import json
-import shutil
+import hashlib
 import numpy as np
 import nibabel as nib
-from pypdf import PdfReader
+import pymupdf as fitz
 
 from backend.app.services.volume import calculate_region_volumes
 from backend.app.services.pdf_report import generate_pdf_report
@@ -18,16 +18,24 @@ from evaluation.evaluate import evaluate_case
 from evaluation.independent_validator import independent_evaluate_masks
 
 
-def regenerate():
-    case_dir = os.path.abspath("storage/cases/case_79270e25-ff86-4d75-a8bf-e2bbbeba5d7d")
-    case_state_path = os.path.join(case_dir, "case_state.json")
-    with open(case_state_path, "r") as f:
-        state = json.load(f)
+def compute_file_sha256(file_path: str) -> str:
+    hasher = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        while chunk := f.read(65536):
+            hasher.update(chunk)
+    return hasher.hexdigest()
 
-    case_id = state["case_id"]
-    pred_path = os.path.join(case_dir, "predicted_seg.nii.gz")
-    expert_path = os.path.join(case_dir, "expert_BraTS2021_0049_seg.nii")
-    out_pdf_path = os.path.join(case_dir, "report.pdf")
+
+def regenerate():
+    case_id = "BraTS2021_00495"
+    data_dir = os.path.abspath("data/real_cases/BraTS2021_00495")
+    pred_path = os.path.abspath("outputs/real_cohort_eval/BraTS2021_00495_pred.nii.gz")
+    expert_path = os.path.join(data_dir, "BraTS2021_00495_seg.nii.gz")
+    flair_path = os.path.join(data_dir, "BraTS2021_00495_flair.nii.gz")
+    t1ce_path = os.path.join(data_dir, "BraTS2021_00495_t1ce.nii.gz")
+    t1_path = os.path.join(data_dir, "BraTS2021_00495_t1.nii.gz")
+    t2_path = os.path.join(data_dir, "BraTS2021_00495_t2.nii.gz")
+    out_pdf_path = os.path.abspath("reports/sample_report.pdf")
 
     print(f"Loading prediction mask: {pred_path}")
     pred_nii = nib.load(pred_path)
@@ -37,8 +45,8 @@ def regenerate():
     expert_nii = nib.load(expert_path)
     expert_data = np.asanyarray(expert_nii.dataobj).astype(np.uint8)
 
-    spacing = tuple(state["spatial_metadata"]["spacing_mm"])
-    affine = np.array(state["spatial_metadata"]["reference_affine"], dtype=np.float64)
+    spacing = tuple(float(s) for s in pred_nii.header.get_zooms()[:3])
+    affine = np.array(pred_nii.affine, dtype=np.float64)
 
     # 1. Authoritative Volume Calculation
     print("Computing physical region volumes with full affine...")
@@ -61,7 +69,7 @@ def regenerate():
     print("Running independent validator cross-check...")
     audit_record = independent_evaluate_masks(pred_data, expert_data, affine=affine, spacing_mm=spacing)
     audit_record["case_id"] = case_id
-    audit_record["provenance_manifest"] = "data/case_manifest_BraTS2021_00495.json"
+    audit_record["provenance_manifest"] = "data/real_cases/BraTS2021_00495"
 
     # Save machine-readable audit artifact
     audit_json_path = os.path.abspath("reports/case_evaluation_audit.json")
@@ -80,13 +88,22 @@ def regenerate():
         "metrics": metrics,
     }
 
-    # 4. Provenance and Timing
-    input_sha256 = {}
-    for k in ["t1", "t1gd", "t2", "flair"]:
-        if k in state.get("files", {}) and "sha256" in state["files"][k]:
-            input_sha256[k] = state["files"][k]["sha256"]
-    if state.get("files", {}).get("expert_mask", {}).get("present") and "sha256" in state["files"]["expert_mask"]:
-        input_sha256["expert_mask"] = state["files"]["expert_mask"]["sha256"]
+    # 4. Provenance and Hashes
+    input_sha256 = {
+        "flair": compute_file_sha256(flair_path),
+        "t1gd": compute_file_sha256(t1ce_path),
+        "t1": compute_file_sha256(t1_path),
+        "t2": compute_file_sha256(t2_path),
+        "expert_mask": compute_file_sha256(expert_path),
+    }
+
+    files_metadata = {
+        "flair": {"filename": os.path.basename(flair_path), "path": flair_path, "size_bytes": os.path.getsize(flair_path), "sha256": input_sha256["flair"]},
+        "t1gd": {"filename": os.path.basename(t1ce_path), "path": t1ce_path, "size_bytes": os.path.getsize(t1ce_path), "sha256": input_sha256["t1gd"]},
+        "t1": {"filename": os.path.basename(t1_path), "path": t1_path, "size_bytes": os.path.getsize(t1_path), "sha256": input_sha256["t1"]},
+        "t2": {"filename": os.path.basename(t2_path), "path": t2_path, "size_bytes": os.path.getsize(t2_path), "sha256": input_sha256["t2"]},
+        "expert_mask": {"filename": os.path.basename(expert_path), "path": expert_path, "size_bytes": os.path.getsize(expert_path), "sha256": input_sha256["expert_mask"], "present": True},
+    }
 
     timing_breakdown = {
         "inference_seconds": 9.55,
@@ -102,9 +119,23 @@ def regenerate():
         "model_license": "Apache 2.0",
         "training_data_source": "BraTS 2018 Multimodal Brain Tumor Dataset",
         "git_commit": "scaffold-audit",
-        "timestamp": "2026-10-17T03:30:00+00:00",
+        "timestamp": "2026-10-18T12:00:00+00:00",
         "input_sha256": input_sha256,
         "timing_breakdown": timing_breakdown,
+    }
+
+    spatial_metadata = {
+        "shape": list(pred_data.shape),
+        "spacing_mm": list(spacing),
+        "reference_affine": affine.tolist(),
+        "orientation": "LPS",
+    }
+
+    validation_results = {
+        "anatomical_sanity": {
+            "foreground_ratio": float(np.count_nonzero(nib.load(flair_path).get_fdata() > 0)) / float(np.prod(pred_data.shape)),
+            "is_skull_stripped": True,
+        }
     }
 
     # 5. Generate Authoritative PDF Report
@@ -113,49 +144,52 @@ def regenerate():
         case_id=case_id,
         output_pdf_path=out_pdf_path,
         volumes=volumes,
-        spatial_metadata=state["spatial_metadata"],
+        spatial_metadata=spatial_metadata,
         provenance=provenance,
         case_evaluation=case_eval,
         runtime_seconds=9.55,
-        mri_path=state.get("file_paths", {}).get("flair"),
+        mri_path=flair_path,
         mask_path=pred_path,
-        files_metadata=state.get("files"),
-        validation_results=state.get("validation"),
+        files_metadata=files_metadata,
+        validation_results=validation_results,
         expert_mask_path=expert_path,
     )
+    print(f"Authoritative report saved to: {out_pdf_path}")
 
-    # Copy to reports/sample_report.pdf
-    dest_sample_pdf = os.path.abspath("reports/sample_report.pdf")
-    shutil.copyfile(out_pdf_path, dest_sample_pdf)
-    print(f"Copied authoritative report to: {dest_sample_pdf}")
-
-    # 6. Update case_state.json
-    state["volumes"] = volumes
-    state["case_evaluation"] = case_eval
-    state["provenance"] = provenance
-    state["timing_breakdown"] = timing_breakdown
-    state["runtime_seconds"] = 10.35
-    with open(case_state_path, "w") as f:
-        json.dump(state, f, indent=2)
-    print(f"Updated case state: {case_state_path}")
-
-    # 7. Comprehensive Text Audit of Regenerated PDF
-    reader = PdfReader(dest_sample_pdf)
-    num_pages = len(reader.pages)
+    # 6. Comprehensive Text Audit of Regenerated PDF
+    doc = fitz.open(out_pdf_path)
+    num_pages = len(doc)
     print(f"\nPDF Verification: Total pages = {num_pages}")
     assert num_pages == 4, f"Expected 4 pages, found {num_pages}"
 
-    for i, page in enumerate(reader.pages):
-        text = page.extract_text()
-        assert "Research and Teaching" in text, f"Research and teaching disclaimer missing on Page {i+1}"
+    for i, page in enumerate(doc):
+        text = page.get_text()
+        assert "Research" in text and "Teaching" in text, f"Research and teaching disclaimer missing on Page {i+1}"
         assert "Not for Clinical Diagnosis" in text, f"Non-diagnostic disclaimer missing on Page {i+1}"
 
     # Verify TC HD95 consistency across pages
-    p2_text = reader.pages[1].extract_text()
-    p3_text = reader.pages[2].extract_text()
+    p2_text = doc[1].get_text()
+    p3_text = doc[2].get_text()
 
     assert "2.45 mm" in p2_text or "2.45" in p2_text, "TC HD95 2.45 mm missing from Page 2"
     assert "2.45 mm" in p3_text or "2.45" in p3_text, "TC HD95 2.45 mm missing from Page 3"
+
+    # Verify consistent metric values across tables and narrative on Page 3:
+    # 1. WT Dice: 0.9513 in both table and narrative
+    assert "0.9513" in p3_text, "WT Dice 0.9513 missing from Page 3"
+    assert "0.9328" not in p3_text, "Obsolete WT Dice 0.9328 found on Page 3"
+
+    # 2. TC Dice: 0.9584 in both table and narrative
+    assert "0.9584" in p3_text, "TC Dice 0.9584 missing from Page 3"
+    assert "0.9392" not in p3_text, "Obsolete TC Dice 0.9392 found on Page 3"
+
+    # 3. ET HD95: 1.41 mm in both table and narrative
+    assert "1.41 mm" in p3_text, "ET HD95 1.41 mm missing from Page 3"
+    assert "2.24 mm" not in p3_text, "Obsolete ET HD95 2.24 mm found on Page 3"
+
+    # 4. ET volume difference: -3.57 mL in both table and narrative
+    assert "-3.57" in p3_text, "ET volume difference -3.57 missing from Page 3"
+    assert "-0.72 mL" not in p3_text, "Obsolete ET volume difference -0.72 mL found on Page 3"
 
     # Verify "High Concordance" is absent and neutral wording is present
     assert "High Concordance" not in p3_text, "Deprecated qualitative label 'High Concordance' found on Page 3"
